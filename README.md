@@ -109,7 +109,12 @@ Script mua ngày đầu tới bước nhập thẻ → bạn thanh toán → gõ
 5. Sơ đồ "Chọn khu vực" → script bấm zone đầu trong `ZONES`, chỉnh số lượng trong pop-up, bấm "Tiếp tục".
    Mỗi vòng script quét trạng thái các zone trong `ZONES` (theo dữ liệu Ticketbox): zone còn vé thử trước theo thứ tự
    bạn ghi, zone hết vé dồn xuống cuối và chỉ thử nhanh. Hết danh sách thì quay vòng (vé có thể được nhả ra).
-   Zone còn ít vé hơn `QTY` thì lấy số còn lại. Sau 3 phút không được → **bíp**, giao lại cho bạn tự bấm.
+   Zone còn ít vé hơn `QTY` thì lấy số còn lại. Script canh vé tối đa **20 phút**; muốn dừng sớm thì gõ `huy` + Enter
+   trong terminal. Dừng (hoặc hết 20 phút) → **bíp**, giao lại cho bạn tự bấm zone.
+   Hộp thoại **"Đơn hàng chưa hoàn thành"** (còn đơn cũ chưa thanh toán của sự kiện này) → script **luôn tự bấm
+   "Hủy đơn, Mua vé mới"** rồi chọn zone. Hộp thoại lạ khác che sơ đồ → **bíp**, script không bấm gì, chờ bạn tự chọn.
+   ⚠️ Khi mua lần lượt nhiều ngày bằng 1 tài khoản: **thanh toán xong đơn trước rồi mới gõ `tiep`**, nếu không đơn trước
+   sẽ bị huỷ ở bước này.
 6. "Bảng câu hỏi" → script tự điền Họ tên / Số điện thoại (kể cả ô "Số điện thoại/Căn cước công dân") / Email,
    tự trả lời mọi câu chọn **bắt buộc** (chọn "đồng ý / xác nhận / đã đọc", checkbox bắt buộc thì tích hết),
    **để trống** các ô xuất hoá đơn không bắt buộc, rồi bấm Tiếp tục.

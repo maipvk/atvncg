@@ -45,6 +45,9 @@ TEXT_CONTINUE = re.compile(r"(tiếp tục|continue|thanh toán|checkout)", re.I
 TEXT_SUBMIT_CODE = re.compile(r"(xác nhận|áp dụng|gửi|submit|apply|confirm|tiếp tục|continue)", re.I)
 TEXT_CODE_PAGE = re.compile(r"(nhập mã|mã presale|mua vé sớm|presale|early ?bird|code)", re.I)
 TEXT_CODE_ERROR = re.compile(r"(không hợp lệ|sai mã|invalid|incorrect|hết hạn|expired)", re.I)
+# Hộp thoại còn đơn cũ chưa thanh toán của cùng sự kiện -> luôn tự bấm "Hủy đơn, Mua vé mới"
+TEXT_OLD_ORDER = re.compile(r"đơn hàng chưa hoàn (thành|tất)", re.I)
+TEXT_CANCEL_OLD = re.compile(r"h(ủ|uỷ|ũy|uy)\s*đơn|mua vé mới", re.I)
 # CAPTCHA của Ticketbox nằm ngay trong trang: "Xác Minh Người Dùng – Chống bot tự động mua vé – Kéo mũi tên qua phải..."
 TEXT_CAPTCHA = re.compile(r"(xác minh người dùng|chống bot|kéo mũi tên)", re.I)
 
@@ -64,8 +67,9 @@ REFRESH_INTERVAL = 4.0
 # Thời gian tối đa chờ qua các bước early bird / CAPTCHA để tới trang chọn vé (giây).
 # Bao gồm cả thời gian ngồi hàng chờ (queue) sau CAPTCHA, có thể rất lâu.
 GATE_TIMEOUT = 3 * 3600
-# Thời gian tối đa script tự thử các zone trên sơ đồ trước khi giao lại cho bạn (giây).
-ZONE_RETRY_TIMEOUT = 180
+# Thời gian tối đa script tự thử các zone trên sơ đồ / canh vé nhả trước khi giao lại cho bạn (giây).
+# Gõ "huy" + Enter trong terminal để dừng canh sớm và tự chọn zone.
+ZONE_RETRY_TIMEOUT = 20 * 60
 # Thời gian tối đa chờ nút "Tiếp tục" trong pop-up hết khoá sau khi chỉnh số lượng (giây); quá thì giao cho bạn bấm.
 CONTINUE_WAIT = 15
 
@@ -628,6 +632,14 @@ def click_zone(page: Page, zone: str, names: dict | None = None, wait_ms: int = 
     return None, len(points)
 
 
+# Nút "Tiếp tục" trong pop-up chọn zone đã bấm được chưa (chạy trong trang, Chrome kiểm tra mỗi khung hình).
+_CONTINUE_READY_JS = """() => {
+    const dlg = [...document.querySelectorAll("[role='dialog'], .ant-modal")].filter(d => /chọn khu vực khác/i.test(d.innerText)).pop();
+    if (!dlg) return false;
+    return [...dlg.querySelectorAll('button')].some(b => /tiếp tục|continue/i.test(b.innerText) && !b.disabled && b.offsetParent);
+}"""
+
+
 def continue_button(popup):
     # Nút cuối pop-up: "Vui lòng chọn vé - 2.800.000 đ" (khoá) -> "Tiếp tục - 2.800.000 đ" (bấm được).
     return popup.locator("button").filter(has_text=re.compile(r"tiếp tục|vui lòng chọn vé|continue", re.I)).last
@@ -666,6 +678,65 @@ def wait_after_continue(page: Page, cont, seconds: float) -> str:
     return "stuck"
 
 
+def other_dialog(page: Page):
+    """Hộp thoại đang che sơ đồ mà không phải pop-up chọn zone hay CAPTCHA – vd còn đơn cũ chưa thanh toán của
+    sự kiện này ("Huỷ đơn cũ"). Trả về hộp thoại (hoặc None)."""
+    # Hộp thoại đơn cũ thật: "Đơn hàng chưa hoàn thành – Bạn đang có đơn hàng chưa hoàn tất. Bạn có muốn tiếp tục?
+    # • 1 x CAT 3A – [Quay lại đơn cũ (12:33)] – Hủy đơn, Mua vé mới". Nhận theo chữ phòng khi không dùng khung hộp thoại chuẩn.
+    old = page.get_by_text(TEXT_OLD_ORDER)
+    if _on_top(old):
+        return old.first.locator("xpath=ancestor::*[.//button or .//a][1]")
+    dlg = page.locator(".ant-modal-wrap, [role='dialog'], .tbox-modal").filter(
+        has_not_text=re.compile(r"chọn khu vực khác|xác minh người dùng", re.I))
+    for k in range(min(dlg.count(), 5)):
+        try:
+            d = dlg.nth(k)
+            if d.is_visible() and d.inner_text().strip():
+                return d
+        except Exception:
+            continue
+    return None
+
+
+def wait_other_dialog(page: Page) -> bool:
+    """Hộp thoại đơn cũ chưa thanh toán -> tự bấm "Hủy đơn, Mua vé mới". Hộp thoại lạ khác -> không bấm gì,
+    bíp, chờ bạn chọn. Trả về True nếu đã gặp hộp thoại."""
+    d = other_dialog(page)
+    if not d:
+        return False
+    try:
+        text = " ".join(d.inner_text().split())[:160]
+    except Exception:
+        text = ""
+    if TEXT_OLD_ORDER.search(text):
+        items = ", ".join(re.findall(r"\d+\s*x\s*[^•\n]+?(?=\s*(?:•|Quay lại|Hủy|Huỷ|$))", text)) or "?"
+        cancel = d.get_by_text(TEXT_CANCEL_OLD)
+        if _visible(cancel):
+            print(f"\nCòn đơn cũ chưa thanh toán ({items}) -> tự bấm 'Hủy đơn, Mua vé mới'.")
+            cancel.last.click(timeout=3000, no_wait_after=True)
+            deadline = time.time() + 10
+            while time.time() < deadline and other_dialog(page):
+                nap(0.3)
+            if not other_dialog(page):
+                nap(0.5)
+                return True
+            # vẫn còn hộp thoại (vd hỏi xác nhận huỷ) -> giao bạn xử lý bên dưới
+            try:
+                text = " ".join((other_dialog(page) or d).inner_text().split())[:160]
+            except Exception:
+                pass
+    beep()
+    if TEXT_OLD_ORDER.search(text):
+        print(f"\n>>> Còn đơn cũ chưa thanh toán nhưng script chưa huỷ được: \"{text}\"\n"
+              "    Hãy tự bấm 'Hủy đơn, Mua vé mới' – script chờ, hộp thoại đóng thì chạy tiếp.")
+    else:
+        print(f"\n>>> Có hộp thoại che sơ đồ: \"{text}\"\n    Hãy tự chọn. Script đứng yên chờ, hộp thoại đóng thì chạy tiếp.")
+    while other_dialog(page):
+        nap(0.5)
+    nap(0.5)
+    return True
+
+
 def finish_popup(page: Page, popup, quantity: int, label: str) -> str:
     """Trong pop-up đang mở: chỉnh số lượng, bấm Tiếp tục.
     Trả về "left" (đã sang thanh toán), "soldout" (không chọn được vé) hoặc "gone"/"stuck"."""
@@ -676,11 +747,15 @@ def finish_popup(page: Page, popup, quantity: int, label: str) -> str:
     if got < quantity:
         print(f"{label}: chỉ chọn được {got}/{quantity} vé, vẫn đi tiếp.")
     cont = continue_button(popup)
-    deadline = time.time() + CONTINUE_WAIT
-    while time.time() < deadline and not _ready(cont) and not is_captcha(page):
-        nap(0.2)
+    t0 = time.time()
+    # Nút khoá ~1 giây trong lúc Ticketbox kiểm tra số vé. Để Chrome tự báo ngay khi nút hết khoá (theo từng khung hình)
+    # thay vì hỏi đi hỏi lại – bấm được gần như tức thì.
+    try:
+        page.wait_for_function(_CONTINUE_READY_JS, timeout=CONTINUE_WAIT * 1000)
+    except Exception:
+        pass
     if _ready(cont):
-        print(f"{label} x{got} → bấm Tiếp tục")
+        print(f"{label} x{got} → bấm Tiếp tục (nút sáng sau {time.time() - t0:.1f} giây)")
         cont.click(timeout=3000, no_wait_after=True)
         result = wait_after_continue(page, cont, 8)
     else:
@@ -747,8 +822,24 @@ def wait_map_ready(page: Page, seconds: float = MAP_READY_TIMEOUT) -> dict:
     return names
 
 
+def typed_stop() -> bool:
+    """Bạn có gõ "huy" + Enter trong terminal không (đọc không chặn; dòng gõ khác thì bỏ qua)."""
+    import select
+    try:
+        while select.select([sys.stdin], [], [], 0)[0]:
+            line = sys.stdin.readline()
+            if not line:
+                return False
+            if _plain(line).strip() == "huy":
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def pick_zone(page: Page, zones: list[str], quantity: int, profile: str = "") -> bool:
     names = wait_map_ready(page)
+    print(f"Canh vé tối đa {ZONE_RETRY_TIMEOUT // 60} phút – gõ 'huy' + Enter để dừng canh và tự chọn zone.")
     deadline = time.time() + ZONE_RETRY_TIMEOUT
     round_no = 0
     print("Zone đọc được từ dữ liệu trang:", ", ".join(f"{k}={_zone_label(v)}" for k, v in sorted(names.items())) or "(không có)")
@@ -759,6 +850,7 @@ def pick_zone(page: Page, zones: list[str], quantity: int, profile: str = "") ->
     except Exception:
         pass
     last_summary = None
+    last_round_note = 0.0
     while time.time() < deadline:
         round_no += 1
         found_any = False
@@ -774,9 +866,14 @@ def pick_zone(page: Page, zones: list[str], quantity: int, profile: str = "") ->
             print("Thứ tự thử:", summary)
             last_summary = summary
         for zone in ordered:
+            if typed_stop():
+                print("Bạn gõ 'huy' – dừng canh vé.")
+                return False
             try:
                 if is_captcha(page):
                     wait_for_captcha_solved(page)
+                if wait_other_dialog(page):
+                    names = section_names(page) or names
                 if left_ticket_page(page) or handle_user_popup(page, quantity):
                     return True
                 popup, n_points = click_zone(page, zone, names,
@@ -799,7 +896,10 @@ def pick_zone(page: Page, zones: list[str], quantity: int, profile: str = "") ->
         if not found_any:
             print("Không tìm thấy zone nào trong ZONES trên sơ đồ – giao lại cho bạn (xem debug/konva_*.json).")
             return False
-        print(f"Hết vòng {round_no}, thử lại các zone (vé có thể được nhả ra)...")
+        if round_no == 1 or time.time() - last_round_note > 60:   # canh tới 20 phút: không in mỗi vòng
+            left = int(deadline - time.time())
+            print(f"Hết vòng {round_no}, vẫn canh vé nhả (còn {left // 60} phút {left % 60} giây; gõ 'huy' để dừng)...")
+            last_round_note = time.time()
         nap(0.5)
     return False
 
@@ -1013,6 +1113,53 @@ def bin_popup(page: Page):
         has_text=re.compile(r"nhập số thẻ|6 số đầu", re.I)).last
 
 
+def tick_bin_agree(page: Page, popup, ok) -> None:
+    """Tích ô "Bằng việc tích chọn, bạn xác nhận đã đọc, hiểu và đồng ý..." trong pop-up BIN.
+    Ô này có thể là checkbox thật, checkbox tự vẽ, hoặc chỉ là ô vuông cạnh chữ -> thử lần lượt từng cách,
+    sau mỗi cách xem nút Xác nhận đã sáng chưa (sáng = đã tích được, dừng)."""
+    def ready() -> bool:
+        nap(0.3)
+        return _visible(ok) and ok.is_enabled()
+
+    if ready():
+        return
+    boxes = popup.locator("input[type='checkbox']")
+    for k in range(boxes.count()):                       # 1. checkbox thật (kể cả bị ẩn): bấm nhãn bọc ngoài
+        box = boxes.nth(k)
+        try:
+            if not box.is_checked():
+                wrapper = box.locator("xpath=ancestor::label[1]")
+                (wrapper if wrapper.count() else box).click(force=True, timeout=2000)
+        except Exception:
+            pass
+        if ready():
+            return
+    fake = popup.locator("[role='checkbox'], .ant-checkbox, [class*='checkbox' i], [class*='check-box' i]")
+    for k in range(min(fake.count(), 3)):                # 2. checkbox tự vẽ
+        try:
+            fake.nth(k).click(force=True, timeout=2000)
+        except Exception:
+            pass
+        if ready():
+            return
+    txt = popup.get_by_text(re.compile(r"bằng việc tích chọn", re.I))
+    if _visible(txt):
+        box = txt.first.bounding_box()
+        if box:                                          # 3. ô vuông nằm ngay bên trái dòng chữ
+            page.mouse.click(box["x"] - 16, box["y"] + 11)
+            if ready():
+                return
+        txt.first.click(position={"x": 2, "y": 8})       # 4. bấm đầu dòng chữ (nếu chữ nằm trong nhãn của ô)
+        if ready():
+            return
+    try:
+        import pathlib
+        pathlib.Path("debug").mkdir(exist_ok=True)
+        pathlib.Path("debug", "bin_popup.html").write_text(popup.evaluate("e => e.outerHTML"), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def handle_bin_popup(page: Page, card_bin: str) -> None:
     popup = bin_popup(page)
     digits = re.sub(r"\D", "", card_bin or "")
@@ -1027,17 +1174,8 @@ def handle_bin_popup(page: Page, card_bin: str) -> None:
     first = popup.locator("input:not([type='checkbox']):not([type='radio'])").first
     first.click()
     page.keyboard.type(digits, delay=60)
-    # Ô "Bằng việc tích chọn, bạn xác nhận đã đọc, hiểu và đồng ý..." trong pop-up
-    boxes = popup.locator("input[type='checkbox']")
-    for k in range(boxes.count()):
-        if not boxes.nth(k).is_checked():
-            wrapper = boxes.nth(k).locator("xpath=ancestor::label[1]")
-            (wrapper if wrapper.count() else boxes.nth(k)).click(force=True)
-    if boxes.count() == 0:
-        txt = popup.get_by_text(re.compile(r"bằng việc tích chọn", re.I))
-        if _visible(txt):
-            txt.first.click()
     ok = popup.get_by_role("button", name=re.compile(r"^\s*xác\s*nhận\s*$", re.I)).last
+    tick_bin_agree(page, popup, ok)
     deadline = time.time() + 5
     while time.time() < deadline and not (_visible(ok) and ok.is_enabled()):
         nap(0.2)
