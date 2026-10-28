@@ -1,0 +1,16 @@
+# Phiên đăng nhập Ticketbox/Google của từng tài khoản – KHÔNG BAO GIỜ đẩy lên
+chrome-acc*/
+chrome-profile/
+
+# Thông tin cá nhân: họ tên, SĐT, email, mã presale, 6 số đầu thẻ
+personal.local.sh
+
+# HTML các trang đã lưu khi chạy (có thông tin đặt vé)
+debug/
+
+# Môi trường Python
+.venv/
+__pycache__/
+*.pyc
+
+.DS_Store
