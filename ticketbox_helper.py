@@ -34,7 +34,7 @@ import unicodedata
 from playwright.sync_api import Page, TimeoutError as PWTimeout, sync_playwright
 
 # ============ CẤU HÌNH CHUNG cho mọi tài khoản / ngày ============
-EVENT_URL = "https://ticketbox.vn/tinh-ha-say-hi-dem-4-26656"
+EVENT_URL = "https://ticketbox.vn/the-aura-khong-the-thay-the-isaac-jun-pham-will-st-son-thach-26624"
 OPEN_AT = ""   # giờ mở bán theo giờ máy ví dụ "2026-11-15 10:00:00" để "" nếu đang mở bán rồi
 # ==================================================================
 
@@ -174,7 +174,7 @@ def buy_button(page: Page, showtimes: list[str]):
         row = rows.filter(has_text=showtime) if showtime else rows
         btn = row.get_by_role("button", name=TEXT_BUY).first
         if _visible(btn) and btn.is_enabled():
-            return btn, showtime or row.first.inner_text().split("\n")[0]
+            return btn, showtime or row.first.inner_text(timeout=1000).split("\n")[0]
     return None, None
 
 
@@ -244,7 +244,7 @@ def _on_top(locator, limit: int = 5, min_height: int = 2) -> bool:
                 const y = Math.min(Math.max(r.top + r.height / 2, 0), innerHeight - 1);
                 const top = document.elementFromPoint(x, y);
                 return !!top && (top === e || e.contains(top) || top.contains(e));
-            }""", min_height):
+            }""", min_height, timeout=500):
                 return True
         except Exception:
             continue
@@ -284,8 +284,8 @@ def handle_code_page(page: Page, code: str, tried: set[str]) -> None:
     field.fill(code)
     # Nút ngay sau ô nhập (tránh bấm nhầm nút khác trên trang); chờ hết khoá.
     submit = field.locator("xpath=following::button[1]")
-    if not (_visible(submit) and TEXT_SUBMIT_CODE.search(submit.inner_text() or "")):
-        submit = page.get_by_role("button", name=TEXT_SUBMIT_CODE).last
+    if not (_visible(submit) and TEXT_SUBMIT_CODE.search(submit.inner_text(timeout=1000) or "")):
+        submit = page_button(page, TEXT_SUBMIT_CODE)
     deadline = time.time() + 3
     while time.time() < deadline and not (_visible(submit) and submit.is_enabled()):
         nap(0.1)
@@ -374,7 +374,7 @@ def set_quantity(popup, quantity: int) -> int:
 
     def current() -> int:
         try:
-            return int(qty_input.input_value() or 0)
+            return int(qty_input.input_value(timeout=1000) or 0)
         except Exception:
             return 0
 
@@ -647,7 +647,7 @@ def continue_button(popup):
 
 def _ready(btn) -> bool:
     try:
-        return btn.count() > 0 and btn.is_visible() and btn.is_enabled() and bool(TEXT_CONTINUE.search(btn.inner_text()))
+        return btn.count() > 0 and btn.is_visible() and btn.is_enabled(timeout=1000) and bool(TEXT_CONTINUE.search(btn.inner_text(timeout=1000)))
     except Exception:
         return False
 
@@ -691,7 +691,7 @@ def other_dialog(page: Page):
     for k in range(min(dlg.count(), 5)):
         try:
             d = dlg.nth(k)
-            if d.is_visible() and d.inner_text().strip():
+            if d.is_visible() and d.inner_text(timeout=1000).strip():
                 return d
         except Exception:
             continue
@@ -705,7 +705,7 @@ def wait_other_dialog(page: Page) -> bool:
     if not d:
         return False
     try:
-        text = " ".join(d.inner_text().split())[:160]
+        text = " ".join(d.inner_text(timeout=1000).split())[:160]
     except Exception:
         text = ""
     if TEXT_OLD_ORDER.search(text):
@@ -722,7 +722,7 @@ def wait_other_dialog(page: Page) -> bool:
                 return True
             # vẫn còn hộp thoại (vd hỏi xác nhận huỷ) -> giao bạn xử lý bên dưới
             try:
-                text = " ".join((other_dialog(page) or d).inner_text().split())[:160]
+                text = " ".join((other_dialog(page) or d).inner_text(timeout=1000).split())[:160]
             except Exception:
                 pass
     beep()
@@ -765,7 +765,7 @@ def finish_popup(page: Page, popup, quantity: int, label: str) -> str:
         try:
             import pathlib
             pathlib.Path("debug").mkdir(exist_ok=True)
-            pathlib.Path("debug", "popup.html").write_text(popup.evaluate("e => e.outerHTML"), encoding="utf-8")
+            pathlib.Path("debug", "popup.html").write_text(popup.evaluate("e => e.outerHTML", timeout=2000), encoding="utf-8")
         except Exception:
             pass
         beep()
@@ -784,7 +784,7 @@ def handle_user_popup(page: Page, quantity: int) -> bool:
     if not _visible(popup):
         return False
     try:
-        title = popup.inner_text().split("\n")[0].strip()
+        title = popup.inner_text(timeout=1000).split("\n")[0].strip()
     except Exception:
         title = "Zone bạn chọn"
     result = finish_popup(page, popup, quantity, title)
@@ -1036,7 +1036,8 @@ FORM_IDLE_SECONDS = 2.0
 def submit_questionnaire(page: Page, info: dict) -> bool:
     """Điền rồi bấm Tiếp tục. Chưa qua được thì nhờ bạn sửa, và TỰ BẤM LẠI khi form đã đủ. True nếu đã qua."""
     fill_questionnaire(page, info)
-    cont = page.get_by_role("button", name=TEXT_CONTINUE).last
+    cont = page_button(page, TEXT_CONTINUE)
+    started, no_button_warned = time.time(), False
     last_click, last_missing, warned = 0.0, None, False
     user_editing = False                      # đã từng phải nhờ bạn sửa -> chờ form đứng yên rồi mới bấm
     snap, snap_since = None, time.time()
@@ -1056,6 +1057,10 @@ def submit_questionnaire(page: Page, info: dict) -> bool:
                 last_missing = missing
         elif user_editing and time.time() - snap_since < FORM_IDLE_SECONDS:
             pass                              # bạn còn đang gõ
+        elif not last_click and not _ready(cont) and time.time() - started > 6 and not no_button_warned:
+            beep()
+            print("\n>>> Form đã đủ nhưng script chưa bấm được nút 'Tiếp tục' – hãy tự bấm. Script chờ, sang trang sau thì chạy tiếp.")
+            no_button_warned = True
         elif _ready(cont) and time.time() - last_click > 4:
             if last_click:
                 print("  Bấm lại Tiếp tục")
@@ -1103,6 +1108,22 @@ _PAYMENT_CHECKED_JS = """(target) => {
 }"""
 
 
+TEXT_PAY = re.compile(r"^\s*thanh\s*toán\s*$", re.I)
+
+
+def page_button(page: Page, rx):
+    """Nút ĐANG HIỆN có chữ khớp rx. Tìm theo chữ trên nút, không theo "vai trò + tên" (get_by_role): trên trang thật
+    có lúc tìm theo vai trò không ra nút Thanh toán dù nút nằm ngay đó."""
+    return page.locator("button").filter(has_text=rx).filter(visible=True).last
+
+
+def _clickable(btn) -> bool:
+    try:
+        return btn.count() > 0 and btn.is_enabled(timeout=1000)
+    except Exception:
+        return False
+
+
 def is_payment_page(page: Page) -> bool:
     return "payment" in page.url.lower()
 
@@ -1127,7 +1148,7 @@ def tick_bin_agree(page: Page, popup, ok) -> None:
     for k in range(boxes.count()):                       # 1. checkbox thật (kể cả bị ẩn): bấm nhãn bọc ngoài
         box = boxes.nth(k)
         try:
-            if not box.is_checked():
+            if not box.is_checked(timeout=1000):
                 wrapper = box.locator("xpath=ancestor::label[1]")
                 (wrapper if wrapper.count() else box).click(force=True, timeout=2000)
         except Exception:
@@ -1144,7 +1165,7 @@ def tick_bin_agree(page: Page, popup, ok) -> None:
             return
     txt = popup.get_by_text(re.compile(r"bằng việc tích chọn", re.I))
     if _visible(txt):
-        box = txt.first.bounding_box()
+        box = txt.first.bounding_box(timeout=1000)
         if box:                                          # 3. ô vuông nằm ngay bên trái dòng chữ
             page.mouse.click(box["x"] - 16, box["y"] + 11)
             if ready():
@@ -1155,7 +1176,7 @@ def tick_bin_agree(page: Page, popup, ok) -> None:
     try:
         import pathlib
         pathlib.Path("debug").mkdir(exist_ok=True)
-        pathlib.Path("debug", "bin_popup.html").write_text(popup.evaluate("e => e.outerHTML"), encoding="utf-8")
+        pathlib.Path("debug", "bin_popup.html").write_text(popup.evaluate("e => e.outerHTML", timeout=2000), encoding="utf-8")
     except Exception:
         pass
 
@@ -1174,7 +1195,7 @@ def handle_bin_popup(page: Page, card_bin: str) -> None:
     first = popup.locator("input:not([type='checkbox']):not([type='radio'])").first
     first.click()
     page.keyboard.type(digits, delay=60)
-    ok = popup.get_by_role("button", name=re.compile(r"^\s*xác\s*nhận\s*$", re.I)).last
+    ok = popup.locator("button").filter(has_text=re.compile(r"^\s*xác\s*nhận\s*$", re.I)).filter(visible=True).last
     tick_bin_agree(page, popup, ok)
     deadline = time.time() + 5
     while time.time() < deadline and not (_visible(ok) and ok.is_enabled()):
@@ -1202,38 +1223,62 @@ def start_payment(page: Page, method: str, card_bin: str = "") -> bool:
     if method:
         opt = page.get_by_text(re.compile(r"\s*".join(map(re.escape, method.split())), re.I))
         if not _visible(opt):
-            print(f"  Không thấy phương thức '{method}' trên trang.")
-            return False
+            beep()
+            print(f"\n>>> Không thấy phương thức '{method}' trên trang – hãy tự chọn phương thức thanh toán.")
+            return click_pay_and_wait(page, card_bin)
         opt.first.click()
         nap(0.3)
         checked = page.evaluate(_PAYMENT_CHECKED_JS, _norm(method).replace("/", ""))
         print(f"  Chọn phương thức '{method}'" + ("" if checked is not False else " – CHƯA chọn được!"))
         if checked is False:
-            return False
+            beep()
+            print(f"\n>>> Chưa chọn được '{method}' – hãy tự chọn phương thức thanh toán.")
+            return click_pay_and_wait(page, card_bin)
     agreed = page.evaluate(_AGREE_JS)
     print(f"  Đã tích {agreed} ô đồng ý điều khoản." if agreed else "  Không thấy ô đồng ý điều khoản (bỏ qua).")
-    pay = page.get_by_role("button", name=re.compile(r"^\s*thanh\s*toán\s*$", re.I)).last
-    deadline = time.time() + 5
-    while time.time() < deadline and not (_visible(pay) and pay.is_enabled()):
+    return click_pay_and_wait(page, card_bin)
+
+
+def click_pay_and_wait(page: Page, card_bin: str) -> bool:
+    """Bấm "Thanh toán" rồi chờ tới khi THẬT SỰ rời trang thanh toán (sang cổng nhập thẻ / mở tab mới).
+    Không bấm được thì nhờ bạn bấm tay; trong lúc chờ vẫn lo CAPTCHA và pop-up kiểm tra đầu thẻ. Không có giới hạn
+    thời gian: chỉ báo "nhập thẻ" khi trang đã chuyển."""
+    url, n_pages = page.url, len(page.context.pages)
+    pay = page_button(page, TEXT_PAY)
+    deadline = time.time() + 10
+    while time.time() < deadline and not _clickable(pay):
         nap(0.2)
-    if not (_visible(pay) and pay.is_enabled()):
-        print("  Nút Thanh toán chưa bấm được.")
-        return False
-    url = page.url
-    print("  Bấm Thanh toán")
-    pay.click(timeout=3000, no_wait_after=True)
-    deadline = time.time() + 20
-    while time.time() < deadline:
+    clicked = _clickable(pay)
+    if clicked:
+        print("  Bấm Thanh toán")
+        pay.click(timeout=3000, no_wait_after=True)
+    else:
+        dump_page(page, "payment_fail", "")      # lưu đúng lúc không bấm được để tìm nguyên nhân
+        try:
+            info = page.evaluate("""() => [...document.querySelectorAll('button')].filter(b => /thanh\\s*toán/i.test(b.innerText))
+                .map(b => ({text: b.innerText.trim(), disabled: b.disabled, visible: !!b.offsetParent}))""")
+            print("  Nút 'Thanh toán' trên trang:", info)
+        except Exception:
+            pass
+        beep()
+        print("\n>>> Script CHƯA bấm được nút 'Thanh toán' – hãy tự bấm 'Thanh toán' trong Chrome.\n"
+              "    Script vẫn lo CAPTCHA / pop-up kiểm tra đầu thẻ, và báo khi trang đã sang bước nhập thẻ.")
+    since, warned = time.time(), False
+    while True:
         nap(0.3)
         if is_captcha(page):
             wait_for_captcha_solved(page)
-            deadline = time.time() + 20
+            since = time.time()
         elif _visible(bin_popup(page)):
             handle_bin_popup(page, card_bin)
-            deadline = time.time() + 20
-        elif page.url != url:
+            since = time.time()
+        elif (page.url != url and "payment-info" not in page.url) or len(page.context.pages) > n_pages:
             return True
-    return False
+        elif clicked and not warned and time.time() - since > 20:
+            beep()
+            print("\n>>> Đã bấm 'Thanh toán' 20 giây mà trang chưa chuyển – hãy nhìn màn hình (có báo lỗi?) và tự xử lý.\n"
+                  "    Script vẫn chờ, trang sang bước nhập thẻ thì báo.")
+            warned = True
 
 
 def dump_page(page: Page, kind: str, profile: str) -> None:
@@ -1279,11 +1324,11 @@ def buy_one(page: Page, args, showtime: str) -> None:
     on_gateway = start_payment(page, args.payment, args.card_bin)
     beep()
     if on_gateway:
-        print(f"\n>>> [{showtime}] Đã chọn '{args.payment}' và bấm Thanh toán. HÃY TỰ NHẬP THÔNG TIN THẺ và hoàn tất "
+        print(f"\n>>> [{showtime}] Đã sang bước nhập thẻ. HÃY TỰ NHẬP THÔNG TIN THẺ và hoàn tất "
               "(vé chỉ được giữ trong thời gian ngắn!).")
     else:
-        print(f"\n>>> [{showtime}] Đang ở bước thanh toán nhưng script chưa chắc đã qua được (xem các dòng phía trên) – "
-              "hãy nhìn màn hình và tự hoàn tất thanh toán (vé chỉ được giữ trong thời gian ngắn!).")
+        print(f"\n>>> [{showtime}] Script không thấy trang Thanh toán – hãy nhìn màn hình và tự hoàn tất "
+              "(vé chỉ được giữ trong thời gian ngắn!).")
 
 
 def next_or_close(done: str, nxt: str) -> bool:
@@ -1354,6 +1399,8 @@ def main() -> None:
             # -> mất đăng nhập. Tự bắt Ctrl+C bên dưới và đóng Chrome bình thường.
             handle_sigint=False,
         )
+        ctx.set_default_timeout(5000)              # thao tác không ghi thời gian chờ: tối đa 5 giây (mặc định 30)
+        ctx.set_default_navigation_timeout(60000)  # tải trang: 60 giây (ngày mở bán Ticketbox có thể chậm)
         signal.signal(signal.SIGINT, _on_sigint)
         try:
             record_json_responses(ctx)
