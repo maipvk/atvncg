@@ -34,7 +34,7 @@ import unicodedata
 from playwright.sync_api import Page, TimeoutError as PWTimeout, sync_playwright
 
 # ============ CẤU HÌNH CHUNG cho mọi tài khoản / ngày ============
-EVENT_URL = "https://ticketbox.vn/the-aura-khong-the-thay-the-isaac-jun-pham-will-st-son-thach-26624"
+EVENT_URL = "https://ticketbox.vn/tinh-ha-say-hi-dem-4-26656"
 OPEN_AT = ""   # giờ mở bán theo giờ máy ví dụ "2026-11-15 10:00:00" để "" nếu đang mở bán rồi
 # ==================================================================
 
@@ -840,11 +840,62 @@ _AGREE_JS = """() => {
     return n;
 }"""
 
-_FIELD_RULES = [   # thứ tự quan trọng: email trước, rồi điện thoại/CCCD, rồi họ tên
+_FIELD_RULES = [   # so trên nhãn đã bỏ dấu; thứ tự quan trọng: email trước, rồi điện thoại/CCCD, rồi họ tên
     ("email", re.compile(r"e-?mail", re.I)),
-    ("phone", re.compile(r"điện thoại|phone|căn cước|cccd|cmnd|citizen|\bid\b", re.I)),
-    ("fullname", re.compile(r"họ\s*(&|và)?\s*tên|full\s*name|tên người mua|name", re.I)),
+    ("phone", re.compile(r"dien thoai|phone|can cuoc|cccd|cmnd|citizen|\bid\b", re.I)),
+    ("fullname", re.compile(r"ho\s*(&|va)?\s*ten|full\s*name|ten nguoi mua|\bname\b", re.I)),
 ]
+# Ô xuất hoá đơn không bắt buộc: để trống (điền nửa chừng có thể bị đòi điền nốt tên công ty, mã số thuế...)
+_INVOICE_RX = re.compile(r"hoa don|invoice|\bvat\b|ma so thue", re.I)
+
+
+def _plain(text: str) -> str:
+    """Bỏ dấu tiếng Việt, chữ thường: "Số điện thoại" -> "so dien thoai"."""
+    text = unicodedata.normalize("NFD", text or "")
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Mn").replace("đ", "d").replace("Đ", "D").lower()
+
+
+# Câu hỏi dạng chọn (radio / checkbox) trong form Ant Design (.ant-form-item). Bắt buộc = nhãn có
+# .ant-form-item-required hoặc nhóm có aria-required. Câu bắt buộc chưa chọn: radio -> chọn lựa chọn kiểu
+# "đồng ý / xác nhận / đã đọc / có" (câu về hoá đơn thì ưu tiên "không"), không có thì lựa chọn đầu; checkbox -> tích hết.
+_REQUIRED_CHOICES_JS = """() => {
+    const plain = t => (t || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/[đĐ]/g, 'd').toLowerCase().trim();
+    const out = [];
+    for (const it of document.querySelectorAll('.ant-form-item')) {
+        const label = ((it.querySelector('.ant-form-item-label') || it).innerText || '').replace(/\\s+/g, ' ').trim();
+        const required = !!it.querySelector('.ant-form-item-required, [aria-required="true"]');
+        const radios = [...it.querySelectorAll("input[type='radio']")];
+        const boxes = [...it.querySelectorAll("input[type='checkbox']")];
+        const agreeQ = /dong y|agree/.test(plain(it.innerText));
+        const optText = e => ((e.closest('label') || e.parentElement).innerText || '').trim();
+        if (radios.length && !radios.some(r => r.checked) && (required || agreeQ)) {
+            const opts = radios.map(r => ({r, t: plain(optText(r))}));
+            const invoiceQ = /hoa don|invoice|vat/.test(plain(label));
+            const pick = (invoiceQ && opts.find(o => /^(khong|no)\\b/.test(o.t)))
+                      || opts.find(o => /dong y|xac nhan|da doc|^co\\b|yes|agree|confirm/.test(o.t)) || opts[0];
+            (pick.r.closest('label') || pick.r).click();
+            out.push(label.slice(0, 60) + ' -> ' + optText(pick.r).slice(0, 50));
+        }
+        if (boxes.length && (required || agreeQ)) {
+            for (const b of boxes) if (!b.checked) { (b.closest('label') || b).click(); out.push(label.slice(0, 60) + ' -> tích "' + optText(b).slice(0, 40) + '"'); }
+        }
+    }
+    return out;
+}"""
+
+# Câu bắt buộc còn trống (để biết form đã đủ chưa trước khi bấm Tiếp tục).
+_FORM_MISSING_JS = """() => {
+    const out = [];
+    for (const it of document.querySelectorAll('.ant-form-item')) {
+        if (!it.querySelector('.ant-form-item-required, [aria-required="true"]')) continue;
+        const label = ((it.querySelector('.ant-form-item-label') || it).innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 60);
+        const choices = it.querySelectorAll("input[type='radio'], input[type='checkbox']");
+        if (choices.length) { if (![...choices].some(c => c.checked)) out.push(label); continue; }
+        const txt = it.querySelector("input:not([type='radio']):not([type='checkbox']):not([type='hidden']), textarea");
+        if (txt && !txt.value.trim()) out.push(label);
+    }
+    return out;
+}"""
 
 
 def is_questionnaire(page: Page) -> bool:
@@ -852,49 +903,74 @@ def is_questionnaire(page: Page) -> bool:
     return "question" in page.url.lower() or _visible(page.get_by_text(re.compile(r"bảng\s*câu\s*hỏi", re.I)))
 
 
-def fill_questionnaire(page: Page, info: dict) -> bool:
-    """Điền Bảng câu hỏi, tích "Tôi đồng ý", bấm Tiếp tục. True nếu đã qua được bảng câu hỏi."""
+def fill_questionnaire(page: Page, info: dict) -> None:
+    """Điền ô chữ (họ tên / SĐT / email), trả lời câu chọn bắt buộc, tích "đồng ý"."""
     fields = page.evaluate(_FORM_FIELDS_JS)
-    missing = []
     for f in fields:
-        kind = next((k for k, rx in _FIELD_RULES if rx.search(f["label"])), None)
+        label = _plain(f["label"])
+        if not f["required"] and _INVOICE_RX.search(label):
+            print(f"  Bỏ qua '{f['label'][:50]}' (không bắt buộc, xuất hoá đơn)")
+            continue
+        kind = next((k for k, rx in _FIELD_RULES if rx.search(label)), None)
         if kind and info.get(kind):
             page.locator(f'[data-tbx-q="{f["i"]}"]').fill(info[kind])
             print(f"  Điền '{f['label'][:50]}' = {info[kind]}")
-        else:
-            print(f"  Không biết điền gì cho ô '{f['label'][:60]}'" + (" (bắt buộc!)" if f["required"] else ""))
-            if f["required"] and not f["value"]:
-                missing.append(f["label"][:40])
+        elif f["required"] and not f["value"]:
+            print(f"  Không biết điền gì cho ô bắt buộc '{f['label'][:60]}'")
+    for line in page.evaluate(_REQUIRED_CHOICES_JS):
+        print(f"  Chọn: {line}")
     agree_text = page.get_by_text(re.compile(r"^\s*tôi đồng ý\s*$", re.I))
-    if _visible(agree_text):
+    if _visible(agree_text) and page.evaluate(_FORM_MISSING_JS):
         agree_text.first.click()
-    agreed = page.evaluate(_AGREE_JS)
-    if agreed:
-        print(f"  Đã tích {agreed} ô đồng ý.")
-    if missing:
-        beep()
-        print(f"\n>>> Còn ô bắt buộc script không biết điền: {missing}. Hãy tự điền rồi bấm Tiếp tục.")
-        return False
+    page.evaluate(_AGREE_JS)          # form không theo mẫu Ant Design: vẫn tích các ô "đồng ý"
+
+
+# Ảnh chụp giá trị mọi ô trong form – để biết bạn đã ngừng gõ chưa.
+_FORM_SNAPSHOT_JS = """() => [...document.querySelectorAll('input, textarea')]
+    .map(e => (e.type === 'radio' || e.type === 'checkbox') ? (e.checked ? '1' : '0') : e.value).join('\\u0001')"""
+# Bạn đang tự sửa form: chỉ bấm Tiếp tục khi mọi câu bắt buộc đã có trả lời VÀ form đứng yên chừng này giây
+# (tránh bấm khi bạn mới gõ được vài chữ ở ô cuối).
+FORM_IDLE_SECONDS = 2.0
+
+
+def submit_questionnaire(page: Page, info: dict) -> bool:
+    """Điền rồi bấm Tiếp tục. Chưa qua được thì nhờ bạn sửa, và TỰ BẤM LẠI khi form đã đủ. True nếu đã qua."""
+    fill_questionnaire(page, info)
     cont = page.get_by_role("button", name=TEXT_CONTINUE).last
-    deadline = time.time() + 5
-    while time.time() < deadline and not _ready(cont):
-        nap(0.2)
-    if not _ready(cont):
-        beep()
-        print("\n>>> Nút Tiếp tục ở Bảng câu hỏi chưa bấm được – hãy kiểm tra các ô và tự bấm.")
-        return False
-    cont.click(timeout=3000, no_wait_after=True)
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        nap(0.3)
+    last_click, last_missing, warned = 0.0, None, False
+    user_editing = False                      # đã từng phải nhờ bạn sửa -> chờ form đứng yên rồi mới bấm
+    snap, snap_since = None, time.time()
+    while is_questionnaire(page):
         if is_captcha(page):
             wait_for_captcha_solved(page)
-            deadline = time.time() + 15
-        elif not is_questionnaire(page):
-            return True
-    beep()
-    print("\n>>> Vẫn ở Bảng câu hỏi sau khi bấm Tiếp tục – có ô bị báo lỗi? Hãy kiểm tra và tự bấm Tiếp tục.")
-    return False
+            continue
+        now_snap = page.evaluate(_FORM_SNAPSHOT_JS)
+        if now_snap != snap:
+            snap, snap_since = now_snap, time.time()
+        missing = page.evaluate(_FORM_MISSING_JS)
+        if missing:
+            user_editing = True
+            if missing != last_missing:
+                beep()
+                print(f"\n>>> Còn câu bắt buộc chưa trả lời: {missing}. Hãy tự trả lời – xong script tự bấm Tiếp tục.")
+                last_missing = missing
+        elif user_editing and time.time() - snap_since < FORM_IDLE_SECONDS:
+            pass                              # bạn còn đang gõ
+        elif _ready(cont) and time.time() - last_click > 4:
+            if last_click:
+                print("  Bấm lại Tiếp tục")
+            else:
+                print("  Bấm Tiếp tục")
+            cont.click(timeout=3000, no_wait_after=True)
+            last_click = time.time()
+            last_missing = None
+        elif last_click and time.time() - last_click > 4 and not warned:
+            beep()
+            print("\n>>> Đã bấm Tiếp tục nhưng trang chưa cho đi tiếp (có ô báo lỗi?). Hãy kiểm tra – sửa xong script tự bấm lại.")
+            warned = True
+            user_editing = True
+        nap(0.5)
+    return True
 
 
 def pass_questionnaire(page: Page, info: dict) -> None:
@@ -909,9 +985,7 @@ def pass_questionnaire(page: Page, info: dict) -> None:
     print("\nĐang điền Bảng câu hỏi...")
     nap(1)   # chờ form hiện đủ các ô
     dump_page(page, "form", "")
-    if not fill_questionnaire(page, info):
-        while is_questionnaire(page):       # chờ bạn tự xử lý xong
-            nap(0.5)
+    submit_questionnaire(page, info)
 
 
 # ---------- Trang Thanh toán (.../payment-info) ----------

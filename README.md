@@ -111,7 +111,10 @@ Script mua ngày đầu tới bước nhập thẻ → bạn thanh toán → gõ
    bạn ghi, zone hết vé dồn xuống cuối và chỉ thử nhanh. Hết danh sách thì quay vòng (vé có thể được nhả ra).
    Zone còn ít vé hơn `QTY` thì lấy số còn lại. Sau 3 phút không được → **bíp**, giao lại cho bạn tự bấm.
 6. "Bảng câu hỏi" → script tự điền Họ tên / Số điện thoại (kể cả ô "Số điện thoại/Căn cước công dân") / Email,
-   tích "Tôi đồng ý", bấm Tiếp tục. Ô nào không nhận ra mà bắt buộc → **bíp**, bạn tự điền.
+   tự trả lời mọi câu chọn **bắt buộc** (chọn "đồng ý / xác nhận / đã đọc", checkbox bắt buộc thì tích hết),
+   **để trống** các ô xuất hoá đơn không bắt buộc, rồi bấm Tiếp tục.
+   Còn câu bắt buộc script không biết trả lời → **bíp** và in danh sách câu còn thiếu; bạn tự điền. Khi **mọi** câu bắt
+   buộc đã có trả lời và bạn ngừng gõ 2 giây, script tự bấm Tiếp tục.
 7. Trang Thanh toán → script chọn `PAYMENT` (mặc định "Thẻ ghi nợ/Thẻ tín dụng"), tích ô đồng ý điều khoản, bấm "Thanh toán".
    Đợt presale Techcombank: pop-up "Nhập số thẻ để kiểm tra" → script nhập `CARD_BIN` (6 số đầu thẻ), tích ô, bấm Xác nhận.
    `CARD_BIN` để trống ở đợt membership / mở bán thường.
