@@ -541,6 +541,9 @@ def _strings(o, depth=0) -> list:
     return []
 
 
+_STATUS_WORDS = {"sold_out", "book_now", "Sold out", "Book now"}
+
+
 def section_names(page: Page) -> dict:
     """{mã zone: [các tên tìm được]} từ dữ liệu JSON trang đã tải."""
     try:
@@ -548,29 +551,48 @@ def section_names(page: Page) -> dict:
     except Exception:
         return {}
     ids |= {str(i) for i in ids}
-    found: dict = {}
 
-    def walk(o, depth=0):
-        if depth > 10:
-            return
-        if isinstance(o, dict):
-            hits = [v for v in o.values() if isinstance(v, (int, str)) and not isinstance(v, bool) and v in ids]
-            if hits:
-                strs = [v for v in _strings(o) if 1 < len(v) < 80 and v not in ids]
-                for sid in hits:
-                    found.setdefault(int(sid), set()).update(strs)
-            for v in o.values():
-                walk(v, depth + 1)
-        elif isinstance(o, list):
-            for v in o:
-                walk(v, depth + 1)
+    def collect(data) -> dict:
+        found: dict = {}
 
+        def walk(o, depth=0):
+            if depth > 10:
+                return
+            if isinstance(o, dict):
+                hits = [v for v in o.values() if isinstance(v, (int, str)) and not isinstance(v, bool) and v in ids]
+                if hits:
+                    strs = [v for v in _strings(o) if 1 < len(v) < 80 and v not in ids]
+                    for sid in hits:
+                        found.setdefault(int(sid), set()).update(strs)
+                for v in o.values():
+                    walk(v, depth + 1)
+            elif isinstance(o, list):
+                for v in o:
+                    walk(v, depth + 1)
+        walk(data)
+        return found
+
+    # Trang tải lại sơ đồ (vd sau lỗi "Không còn vé") -> trạng thái zone chỉ lấy từ lần tải sơ đồ MỚI NHẤT;
+    # gộp cả lần cũ thì một zone vừa "book_now" vừa "sold_out" và bị coi là hết mãi.
+    names: dict = {}
+    latest_map: dict | None = None
     for r in list(_json_responses):
         try:
-            walk(r.json())
+            found = collect(r.json())
         except Exception:
             continue
-    return {k: sorted(v) for k, v in found.items()}
+        if "/seatmap" in r.url:
+            latest_map = found
+        else:
+            for sid, strs in found.items():
+                names.setdefault(sid, set()).update(strs)
+    if latest_map is None:                       # không có API sơ đồ riêng: dùng như cũ
+        return {k: sorted(v) for k, v in names.items()}
+    out = {}
+    for sid in set(names) | set(latest_map):
+        base = {x for x in names.get(sid, set()) if x not in _STATUS_WORDS}   # tên lấy từ mọi nguồn,
+        out[sid] = sorted(base | latest_map.get(sid, set()))                  # trạng thái chỉ từ sơ đồ mới nhất
+    return out
 
 
 def _zone_label(strings: list) -> str:
@@ -623,6 +645,8 @@ def click_zone(page: Page, zone: str, names: dict | None = None, wait_ms: int = 
         pass
     popup = zone_popup(page)
     for x, y in points:
+        if _visible(popup):          # bạn vừa tự mở pop-up một zone -> không bấm vào sơ đồ (sẽ đóng mất pop-up của bạn)
+            return popup, len(points)
         try:
             page.mouse.click(x, y)
             popup.wait_for(state="visible", timeout=wait_ms)
@@ -659,9 +683,11 @@ def left_ticket_page(page: Page) -> bool:
 
 def wait_after_continue(page: Page, cont, seconds: float) -> str:
     """Sau khi bấm (hoặc chờ bạn bấm) Tiếp tục: CAPTCHA thì chờ bạn giải; nút sáng mà chưa đi thì bấm lại.
-    Trả về "left" (sang thanh toán), "gone" (pop-up đóng, vẫn ở sơ đồ = vừa hết vé) hoặc "stuck"."""
+    Trả về "left" (sang thanh toán), "soldout" / "notenough" (máy chủ báo hết / không đủ vé), "gone" (pop-up đóng,
+    vẫn ở sơ đồ) hoặc "stuck"."""
     deadline = time.time() + seconds
     last_click = time.time()
+    gone_since = None
     while time.time() < deadline:
         nap(0.25)
         if is_captcha(page):
@@ -670,12 +696,52 @@ def wait_after_continue(page: Page, cont, seconds: float) -> str:
             continue
         if left_ticket_page(page):
             return "left"
+        be = handle_be_error(page)
+        if be:
+            return be
         if not _visible(zone_popup(page)):
-            return "gone"
+            gone_since = gone_since or time.time()
+            if time.time() - gone_since > 1.5:      # cho hộp thoại lỗi / chuyển trang kịp hiện
+                return "gone"
+            continue
+        gone_since = None
         if time.time() - last_click > 1.5 and _ready(cont):
             cont.click(timeout=3000, no_wait_after=True)
             last_click = time.time()
     return "stuck"
+
+
+# Lỗi do máy chủ trả về sau khi bấm Tiếp tục (chữ lấy từ mã của Ticketbox). Bấm nút của các hộp thoại này thì
+# trang tải lại sơ đồ. "Vượt số lượng vé tối đa", "Hạn chế quyền mua vé"... không nằm ở đây -> vẫn bíp chờ bạn.
+TEXT_BE_SOLDOUT = re.compile(r"uiii|không còn vé|ticket not available|oops,?\s*sorry", re.I)
+TEXT_BE_NOTENOUGH = re.compile(r"không đủ vé|ticket not enough", re.I)
+TEXT_BE_BUTTON = re.compile(r"chọn ghế khác|book again|^\s*ok\s*$", re.I)
+
+
+def handle_be_error(page: Page) -> str:
+    """Có hộp thoại lỗi máy chủ ("Uiii, Xin lỗi!" / "Không còn vé" / "Không đủ vé") -> tự bấm nút của nó, chờ trang
+    tải lại sơ đồ. Trả về "soldout" / "notenough", hoặc "" nếu không có (hay không chắc chắn -> để cách cũ lo)."""
+    for kind, rx in (("notenough", TEXT_BE_NOTENOUGH), ("soldout", TEXT_BE_SOLDOUT)):
+        title = page.get_by_text(rx)
+        if not _on_top(title):
+            continue
+        box = title.first.locator("xpath=ancestor::*[.//button][1]")
+        btn = box.locator("button").filter(has_text=TEXT_BE_BUTTON).filter(visible=True)
+        if not _visible(btn):
+            return ""                                   # không chắc nút nào -> không bấm bừa
+        try:
+            text = " ".join(box.inner_text(timeout=1000).split())[:100]
+        except Exception:
+            text = ""
+        maps_before = sum("/seatmap" in r.url for r in _json_responses)
+        print(f"  Máy chủ báo: \"{text}\" -> tự bấm '{btn.first.inner_text(timeout=1000).strip()}'")
+        btn.first.click(timeout=3000, no_wait_after=True)
+        end = time.time() + 5                           # chờ hộp thoại đóng và trang tải lại sơ đồ (nếu có)
+        while time.time() < end and (_on_top(page.get_by_text(rx))
+                                     or sum("/seatmap" in r.url for r in _json_responses) == maps_before):
+            nap(0.1)
+        return kind
+    return ""
 
 
 def other_dialog(page: Page):
@@ -701,6 +767,8 @@ def other_dialog(page: Page):
 def wait_other_dialog(page: Page) -> bool:
     """Hộp thoại đơn cũ chưa thanh toán -> tự bấm "Hủy đơn, Mua vé mới". Hộp thoại lạ khác -> không bấm gì,
     bíp, chờ bạn chọn. Trả về True nếu đã gặp hộp thoại."""
+    if handle_be_error(page):
+        return True
     d = other_dialog(page)
     if not d:
         return False
@@ -774,6 +842,10 @@ def finish_popup(page: Page, popup, quantity: int, label: str) -> str:
         result = wait_after_continue(page, cont, 600)
     if result == "gone":
         print(f"{label}: pop-up đóng mà vẫn ở sơ đồ (có thể vừa hết vé).")
+    elif result == "soldout":
+        print(f"{label}: máy chủ báo hết vé -> thử zone khác.")
+    elif result == "notenough":
+        print(f"{label}: máy chủ báo không đủ {got} vé.")
     return result
 
 
@@ -883,10 +955,18 @@ def pick_zone(page: Page, zones: list[str], quantity: int, profile: str = "") ->
                     print(f"Zone '{zone}': " + ("bấm rồi nhưng không mở pop-up (có thể hết vé)." if n_points
                                                  else "không tìm thấy trên sơ đồ."))
                     continue
-                result = finish_popup(page, popup, quantity, f"Zone '{zone}'")
+                q = quantity
+                result = finish_popup(page, popup, q, f"Zone '{zone}'")
+                while result == "notenough" and q > 1:        # "Không đủ vé": lấy ít đi 1 vé, thử lại chính zone đó
+                    q -= 1
+                    print(f"Zone '{zone}': thử lại với {q} vé.")
+                    popup, _ = click_zone(page, zone, section_names(page) or names, POPUP_WAIT_OPEN)
+                    if not popup:
+                        break
+                    result = finish_popup(page, popup, q, f"Zone '{zone}'")
                 if result == "left":
                     return True
-                if result == "soldout" and _visible(zone_popup(page)):
+                if result in ("soldout", "notenough") and _visible(zone_popup(page)):
                     close_zone_popup(page, zone_popup(page))
             except KeyboardInterrupt:
                 raise
@@ -1052,6 +1132,8 @@ def submit_questionnaire(page: Page, info: dict) -> bool:
         if missing:
             user_editing = True
             if missing != last_missing:
+                if last_missing is None:
+                    dump_page(page, "form", "")
                 beep()
                 print(f"\n>>> Còn câu bắt buộc chưa trả lời: {missing}. Hãy tự trả lời – xong script tự bấm Tiếp tục.")
                 last_missing = missing
@@ -1061,6 +1143,7 @@ def submit_questionnaire(page: Page, info: dict) -> bool:
             beep()
             print("\n>>> Form đã đủ nhưng script chưa bấm được nút 'Tiếp tục' – hãy tự bấm. Script chờ, sang trang sau thì chạy tiếp.")
             no_button_warned = True
+            dump_page(page, "form", "")
         elif _ready(cont) and time.time() - last_click > 4:
             if last_click:
                 print("  Bấm lại Tiếp tục")
@@ -1074,7 +1157,8 @@ def submit_questionnaire(page: Page, info: dict) -> bool:
             print("\n>>> Đã bấm Tiếp tục nhưng trang chưa cho đi tiếp (có ô báo lỗi?). Hãy kiểm tra – sửa xong script tự bấm lại.")
             warned = True
             user_editing = True
-        nap(0.5)
+            dump_page(page, "form", "")
+        nap(0.2)
     return True
 
 
@@ -1088,9 +1172,23 @@ def pass_questionnaire(page: Page, info: dict) -> None:
     if not is_questionnaire(page):
         return
     print("\nĐang điền Bảng câu hỏi...")
-    nap(1)   # chờ form hiện đủ các ô
-    dump_page(page, "form", "")
+    wait_form_ready(page)
     submit_questionnaire(page, info)
+
+
+def wait_form_ready(page: Page, seconds: float = 10) -> None:
+    """Không chờ cứng: chờ tới khi form có câu hỏi và số câu đứng yên 0.3 giây (form có thể hiện dần từng câu)."""
+    end, last, stable_since = time.time() + seconds, -1, time.time()
+    while time.time() < end:
+        try:
+            n = page.locator(".ant-form-item, form input, form textarea").count()
+        except Exception:
+            n = 0
+        if n != last:
+            last, stable_since = n, time.time()
+        elif n > 0 and time.time() - stable_since >= 0.3:
+            return
+        nap(0.05)
 
 
 # ---------- Trang Thanh toán (.../payment-info) ----------
@@ -1215,22 +1313,31 @@ def start_payment(page: Page, method: str, card_bin: str = "") -> bool:
     """True nếu đã bấm Thanh toán và trang đã chuyển sang bước nhập thẻ / cổng thanh toán."""
     deadline = time.time() + 20
     while time.time() < deadline and not is_payment_page(page):
-        nap(0.3)
+        nap(0.1)
     if not is_payment_page(page):
         return False
-    nap(1)   # chờ trang hiện đủ
-    dump_page(page, "payment", "")
     if method:
+        # Không chờ cứng: lựa chọn phương thức hiện ra lúc nào thì bấm lúc đó (tối đa 10 giây).
         opt = page.get_by_text(re.compile(r"\s*".join(map(re.escape, method.split())), re.I))
+        try:
+            opt.first.wait_for(state="visible", timeout=10000)
+        except PWTimeout:
+            pass
         if not _visible(opt):
+            dump_page(page, "payment_fail", "")
             beep()
             print(f"\n>>> Không thấy phương thức '{method}' trên trang – hãy tự chọn phương thức thanh toán.")
             return click_pay_and_wait(page, card_bin)
         opt.first.click()
-        nap(0.3)
-        checked = page.evaluate(_PAYMENT_CHECKED_JS, _norm(method).replace("/", ""))
+        checked, end = None, time.time() + 2
+        while time.time() < end:                 # chờ ô radio nhận lựa chọn (thường vài chục mili-giây)
+            checked = page.evaluate(_PAYMENT_CHECKED_JS, _norm(method).replace("/", ""))
+            if checked is not False:
+                break
+            nap(0.05)
         print(f"  Chọn phương thức '{method}'" + ("" if checked is not False else " – CHƯA chọn được!"))
         if checked is False:
+            dump_page(page, "payment_fail", "")
             beep()
             print(f"\n>>> Chưa chọn được '{method}' – hãy tự chọn phương thức thanh toán.")
             return click_pay_and_wait(page, card_bin)
