@@ -34,7 +34,7 @@ import unicodedata
 from playwright.sync_api import Page, TimeoutError as PWTimeout, sync_playwright
 
 # ============ CẤU HÌNH CHUNG cho mọi tài khoản / ngày ============
-EVENT_URL = "https://ticketbox.vn/the-aura-khong-the-thay-the-isaac-jun-pham-will-st-son-thach-26624"
+EVENT_URL = "https://ticketbox.vn/tinh-ha-say-hi-dem-4-26656"
 OPEN_AT = ""   # giờ mở bán theo giờ máy ví dụ "2026-11-15 10:00:00" để "" nếu đang mở bán rồi
 # ==================================================================
 
@@ -351,7 +351,9 @@ def wait_until_left_ticket_page(page: Page, msg: str, quantity: int = 0) -> None
 
 def zone_popup(page: Page):
     # Pop-up sau khi bấm zone: "Khu ĐỈNH NÓC", nút - / số lượng / +, "Chọn khu vực khác", "Tiếp tục - 3.500.000 đ".
-    return page.locator("[role='dialog'], .ant-modal").filter(has_text=re.compile(r"chọn khu vực khác", re.I)).last
+    # Chỉ lấy bản ĐANG HIỆN: sau CAPTCHA trang có thể vẽ lại pop-up, bản cũ vẫn nằm ẩn trong trang.
+    return page.locator("[role='dialog'], .ant-modal").filter(
+        has_text=re.compile(r"chọn khu vực khác", re.I)).filter(visible=True).last
 
 
 def close_zone_popup(page: Page, popup) -> None:
@@ -666,7 +668,7 @@ _CONTINUE_READY_JS = """() => {
 
 def continue_button(popup):
     # Nút cuối pop-up: "Vui lòng chọn vé - 2.800.000 đ" (khoá) -> "Tiếp tục - 2.800.000 đ" (bấm được).
-    return popup.locator("button").filter(has_text=re.compile(r"tiếp tục|vui lòng chọn vé|continue", re.I)).last
+    return popup.locator("button").filter(has_text=re.compile(r"tiếp tục|vui lòng chọn vé|continue", re.I)).filter(visible=True).last
 
 
 def _ready(btn) -> bool:
@@ -677,37 +679,54 @@ def _ready(btn) -> bool:
 
 
 def left_ticket_page(page: Page) -> bool:
-    # Đã sang bước thanh toán: không còn CAPTCHA và đã rời trang chọn vé / sơ đồ.
-    return not is_captcha(page) and ("select-ticket" not in page.url or not is_seat_map(page))
+    # Đã rời trang chọn vé: CHỈ theo địa chỉ trang (Ticketbox luôn đổi địa chỉ khi sang bước sau). Không dựa vào việc
+    # "không thấy tiêu đề sơ đồ" – lớp phủ của pop-up / CAPTCHA che tiêu đề sẽ làm nhận nhầm là đã rời sơ đồ.
+    return "select-ticket" not in page.url and not is_captcha(page)
 
 
 def wait_after_continue(page: Page, cont, seconds: float) -> str:
-    """Sau khi bấm (hoặc chờ bạn bấm) Tiếp tục: CAPTCHA thì chờ bạn giải; nút sáng mà chưa đi thì bấm lại.
-    Trả về "left" (sang thanh toán), "soldout" / "notenough" (máy chủ báo hết / không đủ vé), "gone" (pop-up đóng,
+    """Sau khi bấm (hoặc chờ bạn bấm) Tiếp tục: CAPTCHA thì chờ bạn giải; pop-up còn và nút sáng mà chưa đi thì bấm lại
+    (lần 2 trở đi bấm thẳng bằng JavaScript phòng cú bấm thường không ăn). Cứ 5 giây in trạng thái, không đứng im.
+    Trả về "left" (rời sơ đồ), "soldout" / "notenough" (máy chủ báo hết / không đủ vé), "gone" (pop-up đóng,
     vẫn ở sơ đồ) hoặc "stuck"."""
     deadline = time.time() + seconds
-    last_click = time.time()
-    gone_since = None
+    last_click, clicks, gone_since, last_note = time.time(), 0, None, time.time()
     while time.time() < deadline:
         nap(0.25)
         if is_captcha(page):
             wait_for_captcha_solved(page)
             deadline = time.time() + max(seconds, 10)
+            last_click = 0.0                     # giải xong mà pop-up vẫn còn -> bấm lại ngay
             continue
         if left_ticket_page(page):
             return "left"
         be = handle_be_error(page)
         if be:
             return be
-        if not _visible(zone_popup(page)):
+        popup = zone_popup(page)
+        if not _visible(popup):
             gone_since = gone_since or time.time()
             if time.time() - gone_since > 1.5:      # cho hộp thoại lỗi / chuyển trang kịp hiện
                 return "gone"
             continue
         gone_since = None
-        if time.time() - last_click > 1.5 and _ready(cont):
-            cont.click(timeout=3000, no_wait_after=True)
+        btn = continue_button(popup)
+        ready = _ready(btn)
+        if ready and time.time() - last_click > 1.5:
+            clicks += 1
+            try:
+                if clicks == 1:
+                    btn.click(timeout=3000, no_wait_after=True)
+                else:
+                    print(f"  Pop-up vẫn còn – bấm lại 'Tiếp tục' (lần {clicks})")
+                    btn.evaluate("b => b.click()", timeout=2000)
+            except Exception as e:
+                print(f"  Bấm 'Tiếp tục' lỗi: {type(e).__name__}")
             last_click = time.time()
+        if time.time() - last_note > 5:
+            print(f"  … đang chờ sau 'Tiếp tục': pop-up còn mở, nút {'sáng' if ready else 'khoá / không thấy'}, "
+                  f"đã bấm {clicks} lần, trang: {page.url.split('?')[0][-45:]}")
+            last_note = time.time()
     return "stuck"
 
 
@@ -1163,7 +1182,7 @@ def submit_questionnaire(page: Page, info: dict) -> bool:
 
 
 def pass_questionnaire(page: Page, info: dict) -> None:
-    """Nếu sau bước chọn vé có Bảng câu hỏi thì tự điền; xong (hoặc không có) thì về để báo thanh toán."""
+    """(Dùng riêng / để thử) Nếu đang hoặc sắp tới Bảng câu hỏi thì tự điền. Luồng chính dùng follow_after_tickets."""
     deadline = time.time() + 20
     while time.time() < deadline and not is_questionnaire(page):
         if is_captcha(page):
@@ -1223,7 +1242,8 @@ def _clickable(btn) -> bool:
 
 
 def is_payment_page(page: Page) -> bool:
-    return "payment" in page.url.lower()
+    # Trang Thanh toán của Ticketbox: .../bookings/<id>/payment-info (cổng VNPAY ".../PaymentMethod.html" KHÔNG phải)
+    return "payment-info" in page.url.lower()
 
 
 def bin_popup(page: Page):
@@ -1424,11 +1444,7 @@ def buy_one(page: Page, args, showtime: str) -> None:
     else:
         wait_until_left_ticket_page(page, "Quá lâu chưa tới sơ đồ chọn vé. Hãy tự xử lý tiếp trong Chrome.")
 
-    pass_questionnaire(page, {"fullname": args.fullname, "phone": args.phone, "email": args.email})
-    while is_questionnaire(page) or not left_ticket_page(page):   # chưa qua thì chờ, không báo bừa
-        nap(0.5)
-    print("\nĐang ở trang Thanh toán...")
-    on_gateway = start_payment(page, args.payment, args.card_bin)
+    page, on_gateway = follow_after_tickets(page, args)
     beep()
     if on_gateway:
         print(f"\n>>> [{showtime}] Đã sang bước nhập thẻ. HÃY TỰ NHẬP THÔNG TIN THẺ và hoàn tất "
@@ -1436,6 +1452,51 @@ def buy_one(page: Page, args, showtime: str) -> None:
     else:
         print(f"\n>>> [{showtime}] Script không thấy trang Thanh toán – hãy nhìn màn hình và tự hoàn tất "
               "(vé chỉ được giữ trong thời gian ngắn!).")
+
+
+def current_page(page: Page) -> Page:
+    """Tab mới nhất còn mở (phòng khi Ticketbox mở bước tiếp theo trong tab mới)."""
+    try:
+        open_pages = [p for p in page.context.pages if not p.is_closed()]
+        if open_pages and open_pages[-1] is not page:
+            print(f"  Chuyển sang tab mới: {open_pages[-1].url.split('?')[0][-50:]}")
+            return open_pages[-1]
+    except Exception:
+        pass
+    return page
+
+
+def follow_after_tickets(page: Page, args):
+    """Sau khi chọn vé: nhận bước THEO ĐỊA CHỈ TRANG, không đoán theo thời gian chờ.
+    question-form -> điền Bảng câu hỏi; payment-info -> Thanh toán; select-ticket -> vẫn ở sơ đồ (chờ bạn / script
+    lo pop-up). Trang khác -> chờ, cứ 5 giây in địa chỉ. Trả về (page, đã sang bước nhập thẻ?)."""
+    from urllib.parse import urlparse
+    info = {"fullname": args.fullname, "phone": args.phone, "email": args.email}
+    home = urlparse(args.event_url).hostname or ""
+    last_note = time.time()
+    while True:
+        page = current_page(page)
+        url = page.url
+        host = urlparse(url).hostname or ""
+        if url.startswith("http") and home and not host.endswith(home.replace("www.", "")):
+            print(f"\nĐã sang trang thanh toán bên ngoài ({host}).")      # VNPAY / cổng thẻ: tới bước nhập thẻ
+            return page, True
+        if is_captcha(page):
+            wait_for_captcha_solved(page)
+        elif "question" in url.lower():
+            print("\nĐang điền Bảng câu hỏi...")
+            wait_form_ready(page)
+            submit_questionnaire(page, info)
+        elif is_payment_page(page):
+            print("\nĐang ở trang Thanh toán...")
+            return page, start_payment(page, args.payment, args.card_bin)
+        elif "select-ticket" in url:
+            wait_until_left_ticket_page(page, "Vẫn ở sơ đồ chọn vé – hãy chọn zone (bấm vào zone, script lo số lượng và "
+                                              "Tiếp tục).", args.qty)
+        elif time.time() - last_note > 5:
+            print(f"  … đang chờ trang tiếp theo (hiện tại: {url.split('?')[0][-60:]})")
+            last_note = time.time()
+        nap(0.2)
 
 
 def next_or_close(done: str, nxt: str) -> bool:
