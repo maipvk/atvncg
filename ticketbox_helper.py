@@ -34,7 +34,7 @@ import unicodedata
 from playwright.sync_api import Page, TimeoutError as PWTimeout, sync_playwright
 
 # ============ CẤU HÌNH CHUNG cho mọi tài khoản / ngày ============
-EVENT_URL = "https://ticketbox.vn/tinh-ha-say-hi-dem-4-26656"
+EVENT_URL = "https://ticketbox.vn/the-aura-khong-the-thay-the-isaac-jun-pham-will-st-son-thach-26624"
 OPEN_AT = ""   # giờ mở bán theo giờ máy ví dụ "2026-11-15 10:00:00" để "" nếu đang mở bán rồi
 # ==================================================================
 
@@ -385,10 +385,13 @@ def set_quantity(popup, quantity: int) -> int:
         if n == quantity:
             break
         btn = plus if n < quantity else minus
-        if not _visible(btn) or not btn.first.is_enabled():
+        if not _visible(btn) or not btn.first.is_enabled(timeout=1000):
             break  # đạt giới hạn còn lại của zone / mỗi đơn
-        btn.first.click()
-        nap(0.1)
+        # force: không chờ hiệu ứng mở pop-up chạy xong (~0.3 giây) – vẫn là cú bấm chuột thật vào giữa nút
+        btn.first.click(force=True, timeout=2000)
+        end = time.time() + 1                  # chờ ô số lượng đổi (thường vài chục mili-giây) thay vì nghỉ cứng
+        while time.time() < end and current() == n:
+            nap(0.02)
     return current()
 
 
@@ -502,6 +505,7 @@ def record_json_responses(ctx) -> None:
         if "json" in (r.headers.get("content-type") or "") and len(_json_responses) < 300:
             _json_responses.append(r)
     ctx.on("response", on_response)
+
 
 
 _SECTION_IDS_JS = """() => [].concat(...((window.Konva && window.Konva.stages) || []).map(st =>
@@ -666,6 +670,55 @@ _CONTINUE_READY_JS = """() => {
 }"""
 
 
+# Ghi lại diễn biến nút "Tiếp tục" trong pop-up (mỗi lần đổi chữ / khoá / sáng) để biết chậm do trang khoá nút hay
+# do script. Chỉ ghi, không bấm gì.
+_BTN_TRACE_START_JS = """() => {
+    const t0 = performance.now(); window.__tbxTrace = [];
+    const dlg = () => [...document.querySelectorAll("[role='dialog'], .ant-modal")].filter(d => /chọn khu vực khác/i.test(d.innerText) && d.getClientRects().length).pop();
+    const snap = () => { const d = dlg(); const b = d && [...d.querySelectorAll('button')].filter(x => /tiếp tục|vui lòng chọn vé/i.test(x.innerText)).pop();
+        const st = b ? (b.disabled ? 'khoá' : 'sáng') + ' "' + b.innerText.trim().split(' - ')[0] + '"' : 'không thấy nút';
+        const tr = window.__tbxTrace; if (!tr.length || tr[tr.length - 1][1] !== st) tr.push([Math.round(performance.now() - t0), st]); };
+    snap();
+    if (window.__tbxObs) window.__tbxObs.disconnect();
+    window.__tbxObs = new MutationObserver(snap);
+    window.__tbxObs.observe(document.body, {subtree: true, childList: true, attributes: true, characterData: true});
+    window.__tbxMark = (label) => window.__tbxTrace.push([Math.round(performance.now() - t0), '>> ' + label]);
+}"""
+
+
+def trace_mark(page: Page, label: str) -> None:
+    try:
+        page.evaluate("l => window.__tbxMark && window.__tbxMark(l)", label)
+    except Exception:
+        pass
+
+
+def trace_print(page: Page) -> None:
+    try:
+        tr = page.evaluate("() => window.__tbxTrace || []")
+        if tr:
+            print("  Diễn biến nút: " + " → ".join(f"{ms}ms {st}" for ms, st in tr[:14]))
+    except Exception:
+        pass
+
+
+# Chờ nút ĐỨNG YÊN và bấm được thật: vị trí không đổi qua 2 khung hình liên tiếp và điểm giữa nút đúng là nút đó.
+# Pop-up có hiệu ứng mở ~0.3 giây; bấm lúc đang mở thì cú bấm trượt / bị bỏ qua (đã thấy trên trang thật:
+# bấm ở 36ms không ăn, phải bấm lại ở 1564ms). Tối đa 0.7 giây.
+_WAIT_STILL_JS = """async (b) => {
+    let last = null, same = 0; const t0 = performance.now();
+    while (performance.now() - t0 < 700) {
+        await new Promise(r => requestAnimationFrame(r));
+        const r = b.getBoundingClientRect();
+        const k = [r.x, r.y, r.width, r.height].map(Math.round).join(',');
+        const top = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+        const onTop = !!top && (top === b || b.contains(top));
+        if (k === last && onTop) { if (++same >= 2) return Math.round(performance.now() - t0); } else { same = 0; last = k; }
+    }
+    return -1;
+}"""
+
+
 def continue_button(popup):
     # Nút cuối pop-up: "Vui lòng chọn vé - 2.800.000 đ" (khoá) -> "Tiếp tục - 2.800.000 đ" (bấm được).
     return popup.locator("button").filter(has_text=re.compile(r"tiếp tục|vui lòng chọn vé|continue", re.I)).filter(visible=True).last
@@ -691,8 +744,9 @@ def wait_after_continue(page: Page, cont, seconds: float) -> str:
     vẫn ở sơ đồ) hoặc "stuck"."""
     deadline = time.time() + seconds
     last_click, clicks, gone_since, last_note = time.time(), 0, None, time.time()
+    was_ready = True                             # vừa bấm lúc nút đang sáng
     while time.time() < deadline:
-        nap(0.25)
+        nap(0.05)
         if is_captcha(page):
             wait_for_captcha_solved(page)
             deadline = time.time() + max(seconds, 10)
@@ -712,8 +766,12 @@ def wait_after_continue(page: Page, cont, seconds: float) -> str:
         gone_since = None
         btn = continue_button(popup)
         ready = _ready(btn)
-        if ready and time.time() - last_click > 1.5:
+        # Nút khoá rồi SÁNG LẠI mà pop-up vẫn còn = cú bấm trước bị nuốt (trang khoá nút 2 lần) -> bấm lại ngay.
+        relit = ready and not was_ready
+        was_ready = ready
+        if ready and (relit or time.time() - last_click > 1.5):
             clicks += 1
+            trace_mark(page, f"script bấm lại ({clicks})")
             try:
                 if clicks == 1:
                     btn.click(timeout=3000, no_wait_after=True)
@@ -723,6 +781,7 @@ def wait_after_continue(page: Page, cont, seconds: float) -> str:
             except Exception as e:
                 print(f"  Bấm 'Tiếp tục' lỗi: {type(e).__name__}")
             last_click = time.time()
+            trace_print(page)
         if time.time() - last_note > 5:
             print(f"  … đang chờ sau 'Tiếp tục': pop-up còn mở, nút {'sáng' if ready else 'khoá / không thấy'}, "
                   f"đã bấm {clicks} lần, trang: {page.url.split('?')[0][-45:]}")
@@ -827,7 +886,14 @@ def wait_other_dialog(page: Page) -> bool:
 def finish_popup(page: Page, popup, quantity: int, label: str) -> str:
     """Trong pop-up đang mở: chỉnh số lượng, bấm Tiếp tục.
     Trả về "left" (đã sang thanh toán), "soldout" (không chọn được vé) hoặc "gone"/"stuck"."""
+    t_open = time.time()
+    try:
+        page.evaluate(_BTN_TRACE_START_JS)
+    except Exception:
+        pass
     got = set_quantity(popup, quantity)
+    trace_mark(page, f"đã chọn {got} vé")
+    t_qty = time.time() - t_open
     if got == 0:
         print(f"{label}: không chọn được vé (hết vé?).")
         return "soldout"
@@ -842,8 +908,15 @@ def finish_popup(page: Page, popup, quantity: int, label: str) -> str:
     except Exception:
         pass
     if _ready(cont):
-        print(f"{label} x{got} → bấm Tiếp tục (nút sáng sau {time.time() - t0:.1f} giây)")
-        cont.click(timeout=3000, no_wait_after=True)
+        print(f"{label} x{got} → bấm Tiếp tục (chọn số lượng {t_qty:.2f}s, chờ nút sáng {time.time() - t0:.2f}s)")
+        try:
+            still = cont.evaluate(_WAIT_STILL_JS, timeout=1500)
+            trace_mark(page, f"nút đứng yên (chờ {still}ms)" if still >= 0 else "nút chưa đứng yên sau 700ms")
+        except Exception:
+            pass
+        trace_mark(page, "script bấm Tiếp tục")
+        cont.click(timeout=3000, no_wait_after=True, force=True)
+        trace_print(page)
         result = wait_after_continue(page, cont, 8)
     else:
         result = "stuck"
@@ -1304,7 +1377,8 @@ def handle_bin_popup(page: Page, card_bin: str) -> None:
     digits = re.sub(r"\D", "", card_bin or "")
     if len(digits) != 6:
         beep()
-        print("\n>>> Pop-up kiểm tra đầu thẻ (BIN) – CARD_BIN trong run_dayX.sh chưa có 6 số. Hãy tự nhập, tích ô và Xác nhận.")
+        print(f"\n>>> Pop-up kiểm tra đầu thẻ (BIN) – CARD_BIN trong personal.local.sh chưa đúng 6 số (đang là \"{card_bin}\"). "
+              "Hãy tự nhập, tích ô và Xác nhận.")
         while _visible(bin_popup(page)):
             nap(0.5)
         return
@@ -1554,7 +1628,10 @@ def main() -> None:
     open_at = dt.datetime.strptime(args.open_at, "%Y-%m-%d %H:%M:%S") if args.open_at else None
     print(f"Profile: {args.profile}\nSự kiện: {args.event_url}\nZone ưu tiên: {args.zone} x{args.qty}\n"
           f"Mua lần lượt: {' -> '.join(args.showtime)}\n"
-          f"Mở bán: {open_at or 'ngay'}\nMã presale: {'có' if args.code else 'không'}\n")
+          f"Mở bán: {open_at or 'ngay'}\nMã presale: {'có' if args.code else 'không'}\n"
+          f"6 số đầu thẻ (BIN): {args.card_bin or 'không'}"
+          + ("  <-- KHÔNG PHẢI 6 CHỮ SỐ, kiểm tra lại personal.local.sh (thừa dấu cách sau '='?)"
+             if args.card_bin and not re.fullmatch(r"\d{6}", args.card_bin.strip()) else "") + "\n")
 
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
