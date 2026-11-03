@@ -1,5 +1,8 @@
 # Ticketbox helper
 
+> **Hướng dẫn và các file `.sh` ở thư mục gốc này chỉ dùng cho macOS.**
+> Chạy trên Windows thì dùng thư mục [`windows/`](windows/) và làm theo [`windows/README.md`](windows/README.md).
+
 Script tự chạy: đếm ngược giờ mở bán, tải lại trang, bấm "Mua vé ngay" đúng ngày, điền mã early bird (nếu có),
 chờ hàng chờ, bấm zone trên sơ đồ, chỉnh số lượng, bấm "Tiếp tục".
 **Bạn** chỉ cần: đăng nhập (lần đầu), giải CAPTCHA khi nghe bíp, và thanh toán.
