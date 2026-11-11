@@ -63,7 +63,7 @@ SEL_CODE_INPUT = (
 )
 
 # Khoảng nghỉ giữa các lần tải lại trang sự kiện (giây). Đừng giảm quá thấp: dễ bị chặn.
-REFRESH_INTERVAL = 4.0
+REFRESH_INTERVAL = 1.0
 # Thời gian tối đa chờ qua các bước early bird / CAPTCHA để tới trang chọn vé (giây).
 # Bao gồm cả thời gian ngồi hàng chờ (queue) sau CAPTCHA, có thể rất lâu.
 GATE_TIMEOUT = 3 * 3600
@@ -213,7 +213,12 @@ def is_seat_map(page: Page) -> bool:
 
 
 def is_ticket_page(page: Page) -> bool:
-    return is_seat_map(page)
+    return is_seat_map(page) or is_seat_picker(page)
+
+
+def is_seat_picker(page: Page) -> bool:
+    # Trang sơ đồ CHỌN TỪNG GHẾ: tiêu đề "Chọn vé" + chú thích "Đang trống / Đang chọn / Không chọn được".
+    return _visible(page.get_by_text("Không chọn được", exact=True)) and not is_captcha(page)
 
 
 def is_login_modal(page: Page) -> bool:
@@ -1493,13 +1498,330 @@ def dump_page(page: Page, kind: str, profile: str) -> None:
         print("Không lưu được sơ đồ:", e)
 
 
+# ---------- Sơ đồ chọn từng ghế ----------
+# Ticketbox gửi danh sách ghế trong dữ liệu ".../seatmap": khu -> hàng ("A3") -> ghế ("16", trạng thái, toạ độ x/y).
+# Mỗi ghế là một hình tròn Konva đặt đúng toạ độ đó. Tên ghế = HÀNG-SỐ ("A3-16"), như trên ảnh seat_labels.py vẽ.
+# Màu hình tròn là trạng thái đang hiện: trắng = trống, đỏ = không chọn được, xanh lá = đang chọn.
+
+_SEAT_CIRCLES_JS = """() => {
+    const out = [];
+    for (const st of (window.Konva && window.Konva.stages) || []) {
+        const box = st.container().getBoundingClientRect();
+        for (const c of st.find('Circle')) {
+            const r = c.getClientRect();
+            out.push([c.x(), c.y(), String(c.fill() || '').toLowerCase(), box.left + r.x + r.width / 2, box.top + r.y + r.height / 2]);
+        }
+    }
+    return out;
+}"""
+
+# Điểm bấm có đúng là sơ đồ (canvas) không, hay bị hộp thoại / lớp phủ đè lên.
+_POINT_ON_CANVAS_JS = """([x, y]) => { const e = document.elementFromPoint(x, y);
+    return !!e && e.tagName === 'CANVAS' && x >= 0 && y >= 0 && x < innerWidth && y < innerHeight; }"""
+
+# Ghế nằm ngoài màn hình (sơ đồ cao hơn cửa sổ) -> cuộn trang / khung chứa sơ đồ để ghế ra giữa màn hình.
+_SCROLL_TO_POINT_JS = """([x, y]) => {
+    const dx = x - innerWidth / 2, dy = y - innerHeight / 2;
+    const k = document.querySelector('.konvajs-content');
+    for (let a = k && k.parentElement; a && a !== document.body; a = a.parentElement) {
+        const st = getComputedStyle(a);
+        if (/(auto|scroll)/.test(st.overflowY + st.overflowX) && (a.scrollHeight > a.clientHeight || a.scrollWidth > a.clientWidth)) {
+            a.scrollBy(dx, dy); return;
+        }
+    }
+    window.scrollBy(dx, dy);
+}"""
+_VIEWPORT_JS = "() => [innerWidth, innerHeight]"
+
+
+def seat_key(name: str) -> str:
+    """'a3 - 16' / 'A3-16' -> 'A3-16' (bỏ dấu cách, chữ hoa)."""
+    return re.sub(r"\s+", "", name).upper()
+
+
+def seat_groups(raw: list[str]) -> list[list[str]]:
+    """--seat 'A2-5 A2-6' --seat 'a1 - 5, A1-6' -> [['A2-5','A2-6'], ['A1-5','A1-6']]."""
+    groups = []
+    for g in raw:
+        g = re.sub(r"\s*-\s*", "-", g.strip())          # "A2 - 11" -> "A2-11"
+        names = [seat_key(x) for x in re.split(r"[\s,;]+", g) if x.strip()]
+        if names:
+            groups.append(names)
+    return groups
+
+
+_seatmap_cache: dict = {}      # phản hồi -> ghế đã đọc (đọc mỗi phản hồi một lần, không tải lại liên tục)
+_seatmap_errors: list = []
+
+
+def seatmap_seats() -> dict:
+    """{'A3-16': {x, y, section, price}} từ lần tải sơ đồ ghế MỚI NHẤT (trang có thể tải lại sơ đồ)."""
+    for r in reversed(list(_json_responses)):
+        if "/seatmap" not in r.url:
+            continue
+        if r in _seatmap_cache:
+            if _seatmap_cache[r]:
+                return _seatmap_cache[r]
+            continue
+        try:
+            sections = r.json()["data"]["result"]["sections"]
+        except Exception as e:
+            _seatmap_errors.append(f"{type(e).__name__}: {str(e)[:80]}")
+            continue
+        seats = {}
+        for sec in sections:
+            tt = sec.get("ticketType") or {}
+            for row in sec.get("rows") or []:
+                for st in row.get("seats") or []:
+                    seats[seat_key(f'{row.get("name")}-{st.get("name")}')] = {
+                        "x": st.get("x"), "y": st.get("y"), "status": st.get("status"),
+                        "section": tt.get("name") or sec.get("name"), "price": tt.get("price")}
+        _seatmap_cache[r] = seats
+        if seats:
+            return seats
+    return {}
+
+
+def _rgb(color: str):
+    c = (color or "").strip().lower()
+    if c in ("white",):
+        return 255, 255, 255
+    m = re.fullmatch(r"#([0-9a-f]{3}|[0-9a-f]{6})", c)
+    if m:
+        h = m.group(1)
+        h = "".join(ch * 2 for ch in h) if len(h) == 3 else h
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    m = re.match(r"rgba?\((\d+),\s*(\d+),\s*(\d+)", c)
+    return tuple(int(v) for v in m.groups()) if m else None
+
+
+def seat_color_state(color: str) -> str:
+    """Màu hình tròn -> 'free' (trắng), 'picked' (xanh lá = đang chọn), 'taken' (đỏ / màu khác)."""
+    rgb = _rgb(color)
+    if not rgb:
+        return "taken"
+    r, g, b = rgb
+    if min(r, g, b) >= 230:
+        return "free"
+    if g > r + 60 and g > b + 40:
+        return "picked"
+    return "taken"
+
+
+def seat_screen(page: Page, seats: dict) -> dict:
+    """{'A3-16': (trạng thái theo màu, x, y trên màn hình)} cho các ghế tìm được hình tròn trên sơ đồ."""
+    try:
+        circles = page.evaluate(_SEAT_CIRCLES_JS)
+    except Exception:
+        return {}
+    # Tra theo ô lưới 1 đơn vị quanh toạ độ ghế (sơ đồ lớn có hơn 1000 ghế – so từng cặp thì chậm).
+    grid: dict = {}
+    for c in circles:
+        grid.setdefault((round(c[0]), round(c[1])), []).append(c)
+    out = {}
+    for name, s in seats.items():
+        if s["x"] is None or s["y"] is None:
+            continue
+        gx, gy = round(s["x"]), round(s["y"])
+        near = [c for dx in (-1, 0, 1) for dy in (-1, 0, 1) for c in grid.get((gx + dx, gy + dy), ())]
+        best = min(near, key=lambda c: abs(c[0] - s["x"]) + abs(c[1] - s["y"]), default=None)
+        if best and abs(best[0] - s["x"]) + abs(best[1] - s["y"]) < 1.0:
+            out[name] = (seat_color_state(best[2]), best[3], best[4])
+    return out
+
+
+_CIRCLE_COUNT_JS = "() => ((window.Konva && window.Konva.stages) || []).reduce((n, st) => n + st.find('Circle').length, 0)"
+
+
+def wait_seat_map_ready(page: Page, seconds: float = MAP_READY_TIMEOUT) -> dict:
+    t0 = time.time()
+    deadline, last_note = t0 + seconds, t0
+    while time.time() < deadline:
+        # Hộp "Đơn hàng chưa hoàn thành" (còn đơn cũ đang giữ ghế) / CAPTCHA che trang: trang chưa tải sơ đồ cho tới khi
+        # xử lý xong -> lo ngay ở đây (tự bấm "Hủy đơn, Mua vé mới"), không chờ suông.
+        if is_captcha(page):
+            wait_for_captcha_solved(page)
+        if wait_other_dialog(page):
+            deadline = max(deadline, time.time() + 15)
+        seats = seatmap_seats()
+        screen = seat_screen(page, seats) if seats else {}
+        if seats and screen:
+            print(f"  Sơ đồ ghế sẵn sàng sau {time.time() - t0:.1f}s ({len(screen)}/{len(seats)} ghế thấy trên sơ đồ).")
+            return seats
+        if time.time() - last_note > 3:          # báo đang thiếu gì, không đứng im
+            try:
+                circles = page.evaluate(_CIRCLE_COUNT_JS)
+            except Exception as e:
+                circles = f"lỗi {type(e).__name__}"
+            n_maps = sum("/seatmap" in r.url for r in list(_json_responses))
+            print(f"  … chờ sơ đồ ghế {time.time() - t0:.0f}s: dữ liệu ghế {len(seats)} (phản hồi sơ đồ: {n_maps}"
+                  + (f", lỗi đọc: {_seatmap_errors[-1]}" if _seatmap_errors else "")
+                  + f"), chấm ghế trên sơ đồ: {circles}, khớp: {len(screen)}")
+            last_note = time.time()
+        nap(0.2)
+    print("  Sơ đồ ghế / dữ liệu ghế chưa tải xong sau %d giây." % seconds)
+    return seatmap_seats()
+
+
+def click_seat(page: Page, seats: dict, name: str, want: str) -> bool:
+    """Bấm một ghế cho tới khi nó chuyển sang trạng thái `want` ('picked' = chọn, 'free' = bỏ chọn)."""
+    screen = seat_screen(page, seats).get(name)
+    if not screen:
+        return False
+    _, x, y = screen
+    try:
+        w, h = page.evaluate(_VIEWPORT_JS)
+        for _ in range(3):
+            if 4 <= x <= w - 4 and 4 <= y <= h - 4:
+                break
+            page.evaluate(_SCROLL_TO_POINT_JS, [x, y])
+            nap(0.1)
+            screen = seat_screen(page, seats).get(name)
+            if not screen:
+                return False
+            _, x, y = screen
+        if not page.evaluate(_POINT_ON_CANVAS_JS, [x, y]):
+            return False
+        page.mouse.click(x, y)
+    except Exception:
+        return False
+    end = time.time() + 2
+    while time.time() < end:
+        now = seat_screen(page, seats).get(name)
+        if now and now[0] == want:
+            return True
+        if now and want == "picked" and now[0] == "taken":
+            return False                         # vừa bị người khác lấy
+        nap(0.05)
+    return False
+
+
+def seat_continue(page: Page, label: str) -> str:
+    """Bấm nút cuối trang ("Vui lòng chọn vé" -> "Tiếp tục ...") sau khi đã chọn ghế. Trả về "left" (đã sang bước sau),
+    "soldout" / "notenough" (máy chủ báo ghế không còn) hoặc "stuck"."""
+    btn = page.locator("button.bottomBooking").filter(visible=True).last
+    if not _visible(btn):
+        btn = page_button(page, TEXT_CONTINUE)
+    end = time.time() + CONTINUE_WAIT
+    while time.time() < end and not (_clickable(btn) and TEXT_CONTINUE.search(btn.inner_text(timeout=1000) or "")):
+        if left_ticket_page(page):
+            return "left"
+        nap(0.05)
+    if not _clickable(btn):
+        return "stuck"
+    print(f"{label} → bấm Tiếp tục")
+    btn.click(timeout=3000, no_wait_after=True)
+    last_click, clicks, end = time.time(), 0, time.time() + 10
+    while time.time() < end:
+        nap(0.1)
+        if is_captcha(page):
+            wait_for_captcha_solved(page)
+            end = time.time() + 10
+            last_click = 0.0
+            continue
+        if left_ticket_page(page):
+            return "left"
+        be = handle_be_error(page)
+        if be:
+            return be
+        if _clickable(btn) and TEXT_CONTINUE.search(btn.inner_text(timeout=1000) or "") and time.time() - last_click > 1.5:
+            clicks += 1
+            print(f"  Trang chưa đi tiếp – bấm lại 'Tiếp tục' (lần {clicks})")
+            try:
+                btn.evaluate("b => b.click()", timeout=2000)
+            except Exception:
+                pass
+            last_click = time.time()
+    return "stuck"
+
+
+def pick_seats(page: Page, raw_groups: list[str]) -> bool:
+    """Chọn ĐÚNG các ghế bạn ghi, theo nhóm ưu tiên. Nhóm nào có ghế không trống thì bỏ cả nhóm (không mua lẻ),
+    sang nhóm sau. Hết danh sách thì quay vòng canh ghế (tối đa ZONE_RETRY_TIMEOUT, gõ 'huy' để dừng).
+    True nếu đã sang bước sau trang chọn vé."""
+    groups = seat_groups(raw_groups)
+    seats = wait_seat_map_ready(page)
+    print(f"Sơ đồ chọn từng ghế: {len(seats)} ghế. Canh ghế tối đa {ZONE_RETRY_TIMEOUT // 60} phút – gõ 'huy' + Enter để dừng.")
+    unknown = [n for g in groups for n in g if n not in seats]
+    if unknown:
+        beep()
+        print(f"  ⚠ Không có ghế tên {', '.join(unknown)} trên sơ đồ (xem tên bằng ./inspect_seats.sh rồi seat_labels.py). "
+              "Nhóm có ghế này bị bỏ qua.")
+    deadline, last_summary, warned = time.time() + ZONE_RETRY_TIMEOUT, None, False
+    while time.time() < deadline:
+        seats = seatmap_seats() or seats
+        screen = seat_screen(page, seats)
+        summary = " | ".join(" ".join(f"{n}{'' if screen.get(n, ('?',))[0] in ('free', 'picked') else '✗'}" for n in g)
+                             for g in groups)
+        if summary != last_summary:
+            print("Trạng thái nhóm ghế (✗ = không trống):", summary)
+            last_summary = summary
+        for g in groups:
+            if typed_stop():
+                print("Bạn gõ 'huy' – dừng canh ghế.")
+                return False
+            if is_captcha(page):
+                wait_for_captcha_solved(page)
+            if wait_other_dialog(page):
+                seats = seatmap_seats() or seats
+            if left_ticket_page(page):
+                return True
+            screen = seat_screen(page, seats)
+            if any(screen.get(n, ("taken",))[0] not in ("free", "picked") for n in g):
+                continue
+            # Bỏ các ghế đang chọn mà không thuộc nhóm này (để không mua thừa).
+            for n, st in screen.items():
+                if st[0] == "picked" and n not in g:
+                    click_seat(page, seats, n, "free")
+            got = []
+            for n in g:
+                if screen[n][0] == "picked" or click_seat(page, seats, n, "picked"):
+                    got.append(n)
+                else:
+                    break
+            label = f"Ghế {' '.join(g)} ({seats[g[0]]['section']})"
+            if len(got) < len(g):
+                print(f"{label}: ghế {g[len(got)]} không chọn được – bỏ nhóm này, thử nhóm sau.")
+                for n in got:
+                    click_seat(page, seats, n, "free")
+                continue
+            print(f"{label}: đã chọn đủ {len(g)} ghế.")
+            result = seat_continue(page, label)
+            if result == "left":
+                return True
+            if result in ("soldout", "notenough"):
+                print(f"{label}: máy chủ báo ghế không còn -> thử nhóm sau.")
+                wait_seat_map_ready(page, 15)
+                continue
+            beep()
+            print(f"\n>>> {label}: đã chọn ghế nhưng chưa bấm được 'Tiếp tục'. BẠN BẤM 'Tiếp tục' giúp – script chờ.")
+            return False
+        if not warned:                           # cả vòng không cụm nào chọn được: báo rõ, không im lặng canh
+            beep()
+            print(f"\n>>> Không cụm ghế nào còn trống đủ. Script vẫn canh (ghế có thể được nhả) tối đa "
+                  f"{ZONE_RETRY_TIMEOUT // 60} phút.\n    Muốn tự chọn: gõ 'huy' + Enter, hoặc tự chọn ghế rồi BẤM 'Tiếp tục' "
+                  "trên trang – script lo các bước sau.")
+            warned = True
+        nap(1.0)
+    print("Hết thời gian canh ghế.")
+    return False
+
+
 def buy_one(page: Page, args, showtime: str) -> None:
     """Một đơn: bấm Mua vé đúng ngày -> mã presale / CAPTCHA / hàng chờ -> zone -> Bảng câu hỏi -> Thanh toán."""
     zones = args.zone
     _json_responses.clear()          # dữ liệu sơ đồ của đơn trước không dùng lại
     wait_for_buy_button(page, args.event_url, [showtime])
 
-    if pass_gates_until_ticket_page(page, args.code, args.profile):
+    if args.seat and pass_gates_until_ticket_page(page, args.code, args.profile):
+        dump_page(page, "map", args.profile)
+        print("Đã vào sơ đồ chọn từng ghế, script tự chọn ghế...")
+        if not pick_seats(page, args.seat):
+            wait_until_left_ticket_page(page, "Script không chọn được nhóm ghế nào. Hãy tự CHỌN GHẾ trên sơ đồ và bấm "
+                                              "'Tiếp tục' – script lo các bước sau.")
+    elif args.seat:
+        wait_until_left_ticket_page(page, "Quá lâu chưa tới sơ đồ chọn vé. Hãy tự xử lý tiếp trong Chrome.")
+    elif pass_gates_until_ticket_page(page, args.code, args.profile):
         wait_map_ready(page)
         dump_page(page, "map", args.profile)
         names = map_zone_names(page)
@@ -1564,6 +1886,8 @@ def follow_after_tickets(page: Page, args):
         elif is_payment_page(page):
             print("\nĐang ở trang Thanh toán...")
             return page, start_payment(page, args.payment, args.card_bin)
+        elif "select-ticket" in url and args.seat:
+            wait_until_left_ticket_page(page, "Vẫn ở sơ đồ chọn vé – hãy tự chọn ghế và bấm 'Tiếp tục'.")
         elif "select-ticket" in url:
             wait_until_left_ticket_page(page, "Vẫn ở sơ đồ chọn vé – hãy chọn zone (bấm vào zone, script lo số lượng và "
                                               "Tiếp tục).", args.qty)
@@ -1612,9 +1936,13 @@ def main() -> None:
     ap.add_argument("--showtime", action="append", required=True,
                     help="Ngày muốn mua, giống dòng trong 'Lịch diễn'. Lặp lại để mua lần lượt nhiều ngày, "
                          "vd --showtime '03 Tháng 12' --showtime '04 Tháng 12'")
-    ap.add_argument("--zone", action="append", required=True,
+    ap.add_argument("--zone", action="append", default=[],
                     help="Zone trên sơ đồ, lặp lại theo thứ tự ưu tiên, vd --zone 'ĐỈNH NÓC' --zone 'SỤC SÔI'")
-    ap.add_argument("--qty", type=int, required=True, help="Số vé")
+    ap.add_argument("--seat", action="append", default=[],
+                    help="Sơ đồ chọn từng ghế: một NHÓM ghế mua cùng nhau, lặp lại theo thứ tự ưu tiên, "
+                         "vd --seat 'A2-5 A2-6' --seat 'A1-5 A1-6' (tên ghế xem bằng seat_labels.py)")
+    ap.add_argument("--qty", type=lambda v: int(v) if v.strip() else 0, default=0,
+                    help="Số vé (sơ đồ chọn khu vực; sơ đồ chọn ghế thì số vé = số ghế trong nhóm)")
     ap.add_argument("--code", default="", help="Mã presale / early bird (dùng lại cho mọi ngày)")
     ap.add_argument("--fullname", default="", help="Họ tên điền Bảng câu hỏi")
     ap.add_argument("--phone", default="", help="Số điện thoại (điền cả ô 'Số điện thoại/Căn cước công dân')")
@@ -1626,8 +1954,14 @@ def main() -> None:
     args = ap.parse_args()
 
     open_at = dt.datetime.strptime(args.open_at, "%Y-%m-%d %H:%M:%S") if args.open_at else None
-    print(f"Profile: {args.profile}\nSự kiện: {args.event_url}\nZone ưu tiên: {args.zone} x{args.qty}\n"
-          f"Mua lần lượt: {' -> '.join(args.showtime)}\n"
+    if not args.zone and not args.seat:
+        ap.error("cần ZONES (sơ đồ chọn khu vực) hoặc SEATS (sơ đồ chọn từng ghế)")
+    if args.zone and not args.seat and args.qty < 1:
+        ap.error("ZONES cần QTY (số vé) từ 1 trở lên")
+    print(f"Profile: {args.profile}\nSự kiện: {args.event_url}\n"
+          + (f"Ghế ưu tiên: {' | '.join(args.seat)}\n" if args.seat else "")
+          + (f"Zone ưu tiên: {args.zone} x{args.qty}\n" if args.zone else "")
+          + f"Mua lần lượt: {' -> '.join(args.showtime)}\n"
           f"Mở bán: {open_at or 'ngay'}\nMã presale: {'có' if args.code else 'không'}\n"
           f"6 số đầu thẻ (BIN): {args.card_bin or 'không'}"
           + ("  <-- KHÔNG PHẢI 6 CHỮ SỐ, kiểm tra lại personal.local.sh (thừa dấu cách sau '='?)"

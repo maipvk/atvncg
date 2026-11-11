@@ -11,6 +11,7 @@ chờ hàng chờ, bấm zone trên sơ đồ, chỉnh số lượng, bấm "Ti�
 | `ticketbox_helper.py` | Chương trình chính | Chỉ khối **CẤU HÌNH CHUNG** ở đầu: `EVENT_URL`, `OPEN_AT` |
 | `run_day1.sh` | Tài khoản 1 (vd mua DAY 3) | `PROFILE`, `SHOWTIMES`, `ZONES`, `QTY`, `PAYMENT` |
 | `run_day2.sh` | Tài khoản 2 (vd mua DAY 4), chạy song song | như trên |
+| `run_day3.sh`, `run_day4.sh` | Tài khoản 3, 4 (vd mở bán thường: 4 cửa sổ cùng lúc) | như trên |
 | `personal.local.sh` | **Thông tin cá nhân**, chỉ có trên máy bạn (không đẩy lên GitHub) | `FULLNAME`, `PHONE`, `EMAIL`, `CODE`, `CARD_BIN` |
 | `personal.example.sh` | File mẫu trống của `personal.local.sh` | Không sửa |
 | `login.sh` | Mở Chrome thường với profile của script để đăng nhập bằng Google | Không sửa |
@@ -94,6 +95,13 @@ Trước giờ mở bán 5–10 phút, mở 2 tab terminal (Cmd+T), mỗi tab ch
 Đặt 2 cửa sổ Chrome cạnh nhau. Hai CAPTCHA hiện gần như cùng lúc thì giải cửa sổ của ngày bạn muốn hơn trước.
 **Đừng** để hai file cùng một ngày (mỗi ngày mã chỉ dùng được 1 đơn).
 
+### Mở bán thường: 4 tài khoản cùng lúc
+
+Không cần mã nên các tài khoản mua cùng ngày cũng được. Mỗi tài khoản một profile riêng (`chrome-acc1` … `chrome-acc4`),
+đăng nhập trước bằng `login.sh chrome-acc3`, `login.sh chrome-acc4`. Mở 4 tab terminal, mỗi tab chạy một file
+`run_day1.sh` … `run_day4.sh`. Tài khoản cần họ tên / SĐT / email khác thì gán lại ngay sau dòng `source personal.local.sh`
+trong file của tài khoản đó.
+
 ### Cách dự phòng: 1 tài khoản mua lần lượt
 
 Ghi nhiều ngày trong `SHOWTIMES` của một file, vd `SHOWTIMES=("05 Tháng 12" "06 Tháng 12")`, và chỉ chạy file đó.
@@ -126,6 +134,21 @@ Script mua ngày đầu tới bước nhập thẻ → bạn thanh toán → gõ
    Đợt presale Techcombank: pop-up "Nhập số thẻ để kiểm tra" → script nhập `CARD_BIN` (6 số đầu thẻ), tích ô, bấm Xác nhận.
    `CARD_BIN` để trống ở đợt membership / mở bán thường.
 8. **Bíp** → bạn **tự nhập thông tin thẻ** và hoàn tất. Thanh toán xong gõ `xong` + Enter để đóng Chrome.
+
+## Sơ đồ chọn từng ghế
+
+Có sự kiện (vd phòng trà) không chọn khu vực mà chọn từng ghế. Khi đó ghi đúng ghế muốn mua vào `SEATS` thay cho `ZONES`:
+
+1. Xem tên ghế (sự kiện đang mở bán): sửa `EVENT_URL` / `SHOWTIME` trong `inspect_seats.sh`, chạy
+   `./inspect_seats.sh chrome-acc1` (giải CAPTCHA nếu có, script không bấm ghế nào), rồi `python seat_labels.py` và mở
+   `debug/seats/seat_labels.html`: tên HÀNG-SỐ ghi trên từng ghế.
+   Nhà hát Bến Thành (cùng ban tổ chức) dùng chung sơ đồ cho mọi sự kiện cùng lầu, chỉ khác tên hạng / giá: xem sẵn
+   `seatmaps/ben_thanh_lau1.html`, `seatmaps/ben_thanh_lau3.html` (đã đối chiếu với số ghế hiện trên Ticketbox). 3 hàng đầu
+   Lầu 3 trên Ticketbox không ghi chữ hàng: từ trên xuống là `A1`, `A2`, `A3`.
+2. Trong file chạy: `SEATS=("A2-5 A2-6" "A1-5 A1-6")` – mỗi nhóm là các ghế mua cùng nhau, theo thứ tự ưu tiên.
+3. Script chọn nhóm đầu mà mọi ghế đều trống, bấm đúng từng ghế rồi Tiếp tục. Ghế nào bị lấy (lúc đang bấm hay máy chủ
+   báo "Uiii, Xin lỗi!") thì bỏ cả nhóm, sang nhóm sau – không mua lẻ. Hết danh sách thì canh lại tối đa 20 phút
+   (gõ `huy` để dừng), rồi bíp để bạn tự chọn.
 
 ## Dừng script
 
